@@ -135,6 +135,17 @@ struct tdvf_section {
     uint64_t memory_address, memory_data_size;
     uint32_t type, attributes;
 };
+struct tdvf_image {
+    uint8_t *data;
+    long size;
+    struct tdvf_metadata *metadata;
+    struct tdvf_section *sections;
+    uint8_t *low_mem;
+    uint8_t *fw_mem;
+    uint64_t hob_gpa;
+    int low_gmem;
+    int fw_gmem;
+};
 struct efi_hob_header { uint16_t type, length; uint32_t reserved; } __attribute__((packed));
 struct efi_hob_handoff {
     struct efi_hob_header header; uint32_t version, boot_mode;
@@ -187,6 +198,126 @@ static int build_hob(void *buffer, size_t size, uint64_t hob_gpa)
     *last = (struct efi_hob_header) { .type = 0xffff, .length = sizeof(*last) };
     p += sizeof(*last);
     hit->end_of_hob_list = hob_gpa + (uint64_t)(p - (uint8_t *)buffer);
+    return 0;
+}
+
+static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
+{
+    FILE *file;
+    uint32_t metadata_offset;
+
+    memset(tdvf, 0, sizeof(*tdvf));
+    tdvf->low_gmem = -1;
+    tdvf->fw_gmem = -1;
+
+    file = fopen(path, "rb");
+    if (!file) {
+        perror("[-] Open TDVF image");
+        return -1;
+    }
+    if (fseek(file, 0, SEEK_END) || (tdvf->size = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET)) {
+        perror("[-] Determine TDVF image size");
+        fclose(file);
+        return -1;
+    }
+
+    tdvf->data = malloc((size_t)tdvf->size);
+    if (!tdvf->data ||
+        fread(tdvf->data, 1, (size_t)tdvf->size, file) != (size_t)tdvf->size) {
+        perror("[-] Read TDVF image");
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+
+    if (tdvf->size < TDVF_METADATA_OFFSET + 4) {
+        fprintf(stderr, "[-] TDVF image too small\n");
+        return -1;
+    }
+    memcpy(&metadata_offset, tdvf->data + tdvf->size - TDVF_METADATA_OFFSET,
+           sizeof(metadata_offset));
+    if ((uint64_t)metadata_offset + sizeof(struct tdvf_metadata) >
+        (uint64_t)tdvf->size) {
+        fprintf(stderr, "[-] Invalid TDVF metadata offset\n");
+        return -1;
+    }
+
+    tdvf->metadata = (void *)(tdvf->data + metadata_offset);
+    if (tdvf->metadata->signature != TDVF_SIGNATURE ||
+        tdvf->metadata->version != 1 ||
+        tdvf->metadata->length != sizeof(*tdvf->metadata) +
+            tdvf->metadata->nr_sections * sizeof(struct tdvf_section) ||
+        (uint64_t)metadata_offset + tdvf->metadata->length >
+            (uint64_t)tdvf->size) {
+        fprintf(stderr, "[-] Invalid TDVF metadata\n");
+        return -1;
+    }
+    tdvf->sections = (void *)(tdvf->metadata + 1);
+    printf("[+] Loaded TDVF %s (%ld bytes, %u sections)\n", path,
+           tdvf->size, tdvf->metadata->nr_sections);
+
+    tdvf->low_mem = mmap(NULL, LOW_MEM_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    tdvf->fw_mem = mmap(NULL, FW_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tdvf->low_mem == MAP_FAILED || tdvf->fw_mem == MAP_FAILED) {
+        perror("[-] mmap guest memory");
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < tdvf->metadata->nr_sections; i++) {
+        struct tdvf_section *section = &tdvf->sections[i];
+        uint8_t *destination;
+
+        if ((section->memory_address | section->memory_data_size) & 0xfff ||
+            section->raw_data_size > section->memory_data_size ||
+            (uint64_t)section->data_offset + section->raw_data_size >
+                (uint64_t)tdvf->size) {
+            fprintf(stderr, "[-] Invalid TDVF section %u\n", i);
+            return -1;
+        }
+        if (section->memory_address + section->memory_data_size <= LOW_MEM_SIZE) {
+            destination = tdvf->low_mem + section->memory_address;
+        } else if (section->memory_address >= FW_BASE &&
+                   section->memory_address + section->memory_data_size <=
+                       FW_BASE + FW_SIZE) {
+            destination = tdvf->fw_mem + section->memory_address - FW_BASE;
+        } else {
+            fprintf(stderr, "[-] TDVF section %u outside guest slots\n", i);
+            return -1;
+        }
+        if (section->raw_data_size) {
+            memcpy(destination, tdvf->data + section->data_offset,
+                   section->raw_data_size);
+        }
+        if (section->type == TDVF_SECTION_HOB) {
+            tdvf->hob_gpa = section->memory_address;
+            if (build_hob(destination, section->memory_data_size,
+                          tdvf->hob_gpa)) {
+                fprintf(stderr, "[-] Failed to build TDVF HOB\n");
+                return -1;
+            }
+        }
+    }
+    if (!tdvf->hob_gpa) {
+        fprintf(stderr, "[-] TDVF has no TD_HOB section\n");
+        return -1;
+    }
+
+    if (register_gmem_slot(vm_fd, 0, 0, LOW_MEM_SIZE, tdvf->low_mem,
+                           &tdvf->low_gmem) ||
+        register_gmem_slot(vm_fd, 1, FW_BASE, FW_SIZE, tdvf->fw_mem,
+                           &tdvf->fw_gmem)) {
+        perror("[-] Register guest memory");
+        return -1;
+    }
+    if (set_private(vm_fd, 0, LOW_MEM_SIZE, 1) ||
+        set_private(vm_fd, FW_BASE, FW_SIZE, 1)) {
+        perror("[-] Set private memory");
+        return -1;
+    }
+    printf("[+] Registered 2 GiB low RAM and 16 MiB TDVF firmware as private memory.\n");
     return 0;
 }
 
@@ -292,6 +423,97 @@ static void tdx_filter_cpuid(struct kvm_cpuid2 *cpuids)
     cpuids->nent = dest_cnt;
 }
 
+static int configure_vcpu(int kvm_fd, int vm_fd, uint64_t hob_gpa)
+{
+    size_t cpuid_size = sizeof(struct kvm_cpuid2) +
+                        512 * sizeof(struct kvm_cpuid_entry2);
+    struct kvm_cpuid2 *cpuid;
+    struct kvm_cpuid_entry2 *leaf1;
+    int vcpu_fd;
+
+    printf("[+] Creating TDX vCPU (KVM_CREATE_VCPU)...\n");
+    vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
+    if (vcpu_fd < 0) {
+        perror("[-] KVM_CREATE_VCPU failed");
+        return -1;
+    }
+    printf("[+] TDX vCPU created successfully! (fd=%d)\n", vcpu_fd);
+
+    cpuid = calloc(1, cpuid_size);
+    if (!cpuid) {
+        perror("[-] Allocate vCPU CPUID");
+        close(vcpu_fd);
+        return -1;
+    }
+    cpuid->nent = 512;
+    if (ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid) < 0) {
+        perror("[-] KVM_GET_SUPPORTED_CPUID for vCPU");
+        free(cpuid);
+        close(vcpu_fd);
+        return -1;
+    }
+
+    leaf1 = cpuid_find_entry(cpuid, 1, 0);
+    if (!leaf1) {
+        fprintf(stderr, "[-] Host CPUID has no leaf 1\n");
+        free(cpuid);
+        close(vcpu_fd);
+        return -1;
+    }
+    leaf1->ecx |= 1U << 21; /* TDX vCPUs require x2APIC. */
+    printf("[+] Installing full vCPU CPUID (%u entries, x2APIC=%u).\n",
+           cpuid->nent, !!(leaf1->ecx & (1U << 21)));
+    if (ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid) < 0) {
+        perror("[-] KVM_SET_CPUID2");
+        free(cpuid);
+        close(vcpu_fd);
+        return -1;
+    }
+    free(cpuid);
+
+    if (tdx_cmd(vcpu_fd, KVM_TDX_INIT_VCPU, 0,
+                (void *)(uintptr_t)hob_gpa) < 0) {
+        perror("[-] KVM_TDX_INIT_VCPU");
+        close(vcpu_fd);
+        return -1;
+    }
+    printf("[+] KVM_TDX_INIT_VCPU succeeded (HOB GPA 0x%llx).\n",
+           (unsigned long long)hob_gpa);
+    return vcpu_fd;
+}
+
+static int initialize_tdvf_memory(int vcpu_fd, const struct tdvf_image* tdvf)
+{
+    for (uint32_t i = 0; i < tdvf->metadata->nr_sections; i++) {
+        const struct tdvf_section* section = &tdvf->sections[i];
+        uint8_t* source = section->memory_address < LOW_MEM_SIZE
+            ? tdvf->low_mem + section->memory_address
+            : tdvf->fw_mem + section->memory_address - FW_BASE;
+        struct kvm_tdx_init_mem_region region = {
+            .source_addr = (uint64_t)(uintptr_t)source,
+            .gpa = section->memory_address,
+            .nr_pages = section->memory_data_size >> 12,
+        };
+        uint32_t flags = (section->attributes & 1) ? KVM_TDX_MEASURE_MEMORY_REGION : 0;
+        int result;
+
+        do {
+            result = tdx_cmd(vcpu_fd, KVM_TDX_INIT_MEM_REGION, flags, &region);
+        } while (result < 0 && (errno == EAGAIN || errno == EINTR));
+
+        if (result < 0) {
+            fprintf(stderr,
+                "[-] KVM_TDX_INIT_MEM_REGION section %u failed: %s\n",
+                i, strerror(errno));
+            return -1;
+        }
+        printf("[+] Initialized TDVF section %u at GPA 0x%llx (%llu pages).\n",
+            i, (unsigned long long)section->memory_address,
+            (unsigned long long)(section->memory_data_size >> 12));
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *payload_path = "td-shim-tdreport.bin";
     if (argc > 1) {
@@ -328,43 +550,12 @@ int main(int argc, char **argv) {
     printf("[+] Successfully created KVM_X86_TDX_VM instance! (fd=%d)\n", vm_fd);
 
     // 4. Load and parse the td-shim TDVF image.
-    FILE *f = fopen(payload_path, "rb");
-    if (!f) { perror("[-] Open TDVF image"); return 1; }
-    fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t *image = malloc(fsize);
-    if (!image || fread(image, 1, fsize, f) != (size_t)fsize) { perror("[-] Read TDVF image"); return 1; }
-    fclose(f);
-    if (fsize < TDVF_METADATA_OFFSET + 4) { fprintf(stderr, "[-] TDVF image too small\n"); return 1; }
-    uint32_t metadata_offset; memcpy(&metadata_offset, image + fsize - TDVF_METADATA_OFFSET, 4);
-    if (metadata_offset + sizeof(struct tdvf_metadata) > (uint32_t)fsize) { fprintf(stderr, "[-] Invalid TDVF metadata offset\n"); return 1; }
-    struct tdvf_metadata *metadata = (void *)(image + metadata_offset);
-    if (metadata->signature != TDVF_SIGNATURE || metadata->version != 1 ||
-        metadata->length != sizeof(*metadata) + metadata->nr_sections * sizeof(struct tdvf_section) ||
-        metadata_offset + metadata->length > (uint32_t)fsize) { fprintf(stderr, "[-] Invalid TDVF metadata\n"); return 1; }
-    struct tdvf_section *sections = (void *)(metadata + 1);
-    printf("[+] Loaded TDVF %s (%ld bytes, %u sections)\n", payload_path, fsize, metadata->nr_sections);
-
-    uint8_t *low_mem = mmap(NULL, LOW_MEM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    uint8_t *fw_mem = mmap(NULL, FW_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (low_mem == MAP_FAILED || fw_mem == MAP_FAILED) { perror("[-] mmap guest memory"); return 1; }
-    uint64_t hob_gpa = 0;
-    for (uint32_t i = 0; i < metadata->nr_sections; i++) {
-        struct tdvf_section *s = &sections[i];
-        if ((s->memory_address | s->memory_data_size) & 0xfff || s->raw_data_size > s->memory_data_size ||
-            (uint64_t)s->data_offset + s->raw_data_size > (uint64_t)fsize) { fprintf(stderr, "[-] Invalid TDVF section %u\n", i); return 1; }
-        uint8_t *dst;
-        if (s->memory_address + s->memory_data_size <= LOW_MEM_SIZE) dst = low_mem + s->memory_address;
-        else if (s->memory_address >= FW_BASE && s->memory_address + s->memory_data_size <= FW_BASE + FW_SIZE) dst = fw_mem + s->memory_address - FW_BASE;
-        else { fprintf(stderr, "[-] TDVF section %u outside guest slots\n", i); return 1; }
-        if (s->raw_data_size) memcpy(dst, image + s->data_offset, s->raw_data_size);
-        if (s->type == TDVF_SECTION_HOB) { hob_gpa = s->memory_address; if (build_hob(dst, s->memory_data_size, hob_gpa)) return 1; }
+    struct tdvf_image tdvf;
+    if (load_tdvf_image(vm_fd, payload_path, &tdvf) < 0) {
+        close(vm_fd);
+        close(kvm_fd);
+        return 1;
     }
-    if (!hob_gpa) { fprintf(stderr, "[-] TDVF has no TD_HOB section\n"); return 1; }
-    int low_gmem = -1, fw_gmem = -1;
-    if (register_gmem_slot(vm_fd, 0, 0, LOW_MEM_SIZE, low_mem, &low_gmem) ||
-        register_gmem_slot(vm_fd, 1, FW_BASE, FW_SIZE, fw_mem, &fw_gmem)) { perror("[-] Register guest memory"); return 1; }
-    if (set_private(vm_fd, 0, LOW_MEM_SIZE, 1) || set_private(vm_fd, FW_BASE, FW_SIZE, 1)) { perror("[-] Set private memory"); return 1; }
-    printf("[+] Registered 2 GiB low RAM and 16 MiB TDVF firmware as private memory.\n");
 
     // 10. Configure TDX Prerequisites & Initialize TDX VM
     // Step 10a: Enable in-kernel Local APIC
@@ -439,52 +630,22 @@ int main(int argc, char **argv) {
         close(kvm_fd);
         return 1;
     }
-    // Keep INIT_VM CPUID data until it is installed on the vCPU.
+    free(init_vm);
 
-    // 11. Create TDX vCPU
-    printf("[+] Creating TDX vCPU (KVM_CREATE_VCPU)...\n");
-    int vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
+    // 11-12. Create and configure the TDX vCPU.
+    int vcpu_fd = configure_vcpu(kvm_fd, vm_fd, tdvf.hob_gpa);
     if (vcpu_fd < 0) {
-        perror("[-] KVM_CREATE_VCPU failed");
         close(vm_fd);
         close(kvm_fd);
         return 1;
     }
-    printf("[+] TDX vCPU created successfully! (fd=%d)\n", vcpu_fd);
-
-    size_t vcpu_cpuid_size = sizeof(struct kvm_cpuid2) + 512 * sizeof(struct kvm_cpuid_entry2);
-    struct kvm_cpuid2 *vcpu_cpuid = calloc(1, vcpu_cpuid_size);
-    if (!vcpu_cpuid) return 1;
-    vcpu_cpuid->nent = 512;
-    if (ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, vcpu_cpuid) < 0) { perror("[-] KVM_GET_SUPPORTED_CPUID for vCPU"); return 1; }
-    struct kvm_cpuid_entry2 *leaf1 = cpuid_find_entry(vcpu_cpuid, 1, 0);
-    if (!leaf1) { fprintf(stderr, "[-] Host CPUID has no leaf 1\n"); return 1; }
-    leaf1->ecx |= 1U << 21; /* TDX vCPUs require x2APIC. */
-    printf("[+] Installing full vCPU CPUID (%u entries, x2APIC=%u).\n",
-           vcpu_cpuid->nent, !!(leaf1->ecx & (1U << 21)));
-    if (ioctl(vcpu_fd, KVM_SET_CPUID2, vcpu_cpuid) < 0) { perror("[-] KVM_SET_CPUID2"); return 1; }
-    free(vcpu_cpuid);
-    free(init_vm);
-
-    // 12. Initialize the TD vCPU with the HOB GPA.
-    if (tdx_cmd(vcpu_fd, KVM_TDX_INIT_VCPU, 0, (void *)(uintptr_t)hob_gpa) < 0) {
-        perror("[-] KVM_TDX_INIT_VCPU"); return 1;
-    }
-    printf("[+] KVM_TDX_INIT_VCPU succeeded (HOB GPA 0x%llx).\n", (unsigned long long)hob_gpa);
 
     // 13. Populate every TDVF section via the vCPU fd, as required by the ABI.
-    for (uint32_t i = 0; i < metadata->nr_sections; i++) {
-        struct tdvf_section *s = &sections[i];
-        uint8_t *source = s->memory_address < LOW_MEM_SIZE ? low_mem + s->memory_address : fw_mem + s->memory_address - FW_BASE;
-        struct kvm_tdx_init_mem_region region = {
-            .source_addr = (uint64_t)(uintptr_t)source, .gpa = s->memory_address,
-            .nr_pages = s->memory_data_size >> 12,
-        };
-        uint32_t flags = (s->attributes & 1) ? KVM_TDX_MEASURE_MEMORY_REGION : 0;
-        int result; do { result = tdx_cmd(vcpu_fd, KVM_TDX_INIT_MEM_REGION, flags, &region); } while (result < 0 && (errno == EAGAIN || errno == EINTR));
-        if (result < 0) { fprintf(stderr, "[-] KVM_TDX_INIT_MEM_REGION section %u failed: %s\n", i, strerror(errno)); return 1; }
-        printf("[+] Initialized TDVF section %u at GPA 0x%llx (%llu pages).\n", i,
-               (unsigned long long)s->memory_address, (unsigned long long)(s->memory_data_size >> 12));
+    if (initialize_tdvf_memory(vcpu_fd, &tdvf) < 0) {
+        close(vcpu_fd);
+        close(vm_fd);
+        close(kvm_fd);
+        return 1;
     }
 
     // 14. Finalize TDX VM state (KVM_TDX_FINALIZE_VM)
