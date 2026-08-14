@@ -132,11 +132,13 @@ struct kvm_tdx_init_mem_region {
 struct tdvf_metadata {
     uint32_t signature, length, version, nr_sections;
 };
+
 struct tdvf_section {
     uint32_t data_offset, raw_data_size;
     uint64_t memory_address, memory_data_size;
     uint32_t type, attributes;
 };
+
 struct tdvf_image {
     uint8_t* data;
     long size;
@@ -148,15 +150,18 @@ struct tdvf_image {
     int low_gmem;
     int fw_gmem;
 };
+
 struct efi_hob_header {
     uint16_t type, length;
     uint32_t reserved;
 } __attribute__((packed));
+
 struct efi_hob_handoff {
     struct efi_hob_header header;
     uint32_t version, boot_mode;
     uint64_t memory_top, memory_bottom, free_memory_top, free_memory_bottom, end_of_hob_list;
 } __attribute__((packed));
+
 struct efi_hob_resource {
     struct efi_hob_header header;
     uint8_t owner[16];
@@ -174,7 +179,11 @@ static void watchdog_handler(int signo)
 
 static int set_private(int vm_fd, uint64_t gpa, uint64_t size, int private)
 {
-    struct kvm_memory_attributes attr = { .address = gpa, .size = size, .attributes = private ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0 };
+    struct kvm_memory_attributes attr = {
+        .address = gpa,
+        .size = size,
+        .attributes = private ? KVM_MEMORY_ATTRIBUTE_PRIVATE : 0
+    };
     return ioctl(vm_fd, KVM_SET_MEMORY_ATTRIBUTES, &attr);
 }
 
@@ -530,14 +539,14 @@ int main(int argc, char** argv)
     printf("     Direct KVM Runner for Intel TDX Bare-Metal Payload     \n");
     printf("============================================================\n");
 
-    // 1. Open /dev/kvm
+    // Open /dev/kvm
     int kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm_fd < 0) {
         perror("[-] Failed to open /dev/kvm");
         return 1;
     }
 
-    // 2. Check KVM API Version
+    // Check KVM API Version
     int api_ver = ioctl(kvm_fd, KVM_GET_API_VERSION, 0);
     if (api_ver != 12) {
         fprintf(stderr, "[-] Unexpected KVM API version: %d (expected 12)\n", api_ver);
@@ -545,7 +554,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 3. Create Intel TDX VM instance (type = 5: KVM_X86_TDX_VM)
+    // Create Intel TDX VM instance (type = 5: KVM_X86_TDX_VM)
     printf("[+] Attempting KVM_CREATE_VM (type=%d: KVM_X86_TDX_VM)...\n", KVM_X86_TDX_VM);
     int vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, KVM_X86_TDX_VM);
     if (vm_fd < 0) {
@@ -555,7 +564,7 @@ int main(int argc, char** argv)
     }
     printf("[+] Successfully created KVM_X86_TDX_VM instance! (fd=%d)\n", vm_fd);
 
-    // 4. Load and parse the td-shim TDVF image.
+    // Load and parse the td-shim TDVF image.
     struct tdvf_image tdvf;
     if (load_tdvf_image(vm_fd, payload_path, &tdvf) < 0) {
         close(vm_fd);
@@ -563,8 +572,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 10. Configure TDX Prerequisites & Initialize TDX VM
-    // Step 10a: Enable in-kernel Local APIC
+    // Configure TDX Prerequisites & Initialize TDX VM
+    // Enable in-kernel Local APIC
     struct kvm_enable_cap split_irqchip = {
         .cap = KVM_CAP_SPLIT_IRQCHIP,
         .args = { 24 }, // 24 GSIs
@@ -574,8 +583,7 @@ int main(int argc, char** argv)
     } else if (ioctl(vm_fd, KVM_CREATE_IRQCHIP, 0) == 0) {
         printf("[+] Created in-kernel IRQCHIP (KVM_CREATE_IRQCHIP).\n");
     }
-
-    // Step 10b: Enable KVM_CAP_X86_APIC_BUS_CYCLES_NS (25MHz = 40ns)
+    // Enable KVM_CAP_X86_APIC_BUS_CYCLES_NS (25MHz = 40ns)
     int apic_ext = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_X86_APIC_BUS_CYCLES_NS);
     if (apic_ext > 0) {
         struct kvm_enable_cap apic_cap = {
@@ -593,7 +601,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Step 10c: Fetch TDX capabilities
+    // Fetch TDX capabilities
     printf("[+] Fetching hardware TDX capabilities (get_tdx_capabilities)...\n");
     if (get_tdx_capabilities(vm_fd) < 0) {
         fprintf(stderr, "[-] get_tdx_capabilities failed\n");
@@ -602,7 +610,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Step 10d: Initialize TDX VM
+    // Initialize TDX VM
     printf("[+] Initializing TDX VM (KVM_TDX_INIT_VM)...\n");
     size_t init_sz = sizeof(struct kvm_tdx_init_vm) + 512 * sizeof(struct kvm_cpuid_entry2);
     struct kvm_tdx_init_vm* init_vm = (struct kvm_tdx_init_vm*)calloc(1, init_sz);
@@ -641,7 +649,7 @@ int main(int argc, char** argv)
     }
     free(init_vm);
 
-    // 11-12. Create and configure the TDX vCPU.
+    // Create and configure the TDX vCPU.
     int vcpu_fd = configure_vcpu(kvm_fd, vm_fd, tdvf.hob_gpa);
     if (vcpu_fd < 0) {
         close(vm_fd);
@@ -649,7 +657,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 13. Populate every TDVF section via the vCPU fd, as required by the ABI.
+    // Populate every TDVF section via the vCPU fd, as required by the ABI.
     if (initialize_tdvf_memory(vcpu_fd, &tdvf) < 0) {
         close(vcpu_fd);
         close(vm_fd);
@@ -657,7 +665,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 14. Finalize TDX VM state (KVM_TDX_FINALIZE_VM)
+    // Finalize TDX VM state (KVM_TDX_FINALIZE_VM)
     printf("[+] Finalizing TDX VM state (KVM_TDX_FINALIZE_VM)...\n");
     int fin_res = tdx_cmd(vm_fd, KVM_TDX_FINALIZE_VM, 0, NULL);
     if (fin_res == 0) {
@@ -671,7 +679,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 15. Map KVM Run buffer
+    // Map KVM Run buffer
     int mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
     if (mmap_size < 0) {
         perror("[-] KVM_GET_VCPU_MMAP_SIZE failed");
@@ -693,7 +701,7 @@ int main(int argc, char** argv)
     printf("[+] Executing guest CPU run loop (capturing COM1 UART 0x3F8 I/O exits)...\n");
     printf("------------------------------------------------------------\n");
 
-    // 16. Run Loop. A halted in-kernel LAPIC vCPU can otherwise block forever.
+    // Run Loop. A halted in-kernel LAPIC vCPU can otherwise block forever.
     struct sigaction watchdog_action = { .sa_handler = watchdog_handler };
     sigemptyset(&watchdog_action.sa_mask);
     sigaction(SIGALRM, &watchdog_action, NULL);
