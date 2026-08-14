@@ -10,7 +10,6 @@ A minimal, zero-dependency `no_std` Rust bare-metal payload and direct C KVM hyp
 .
 ├── Cargo.toml                  # Rust package manifest (no_std, x86_64, spin)
 ├── .cargo/config.toml          # Cargo build flags for x86_64-unknown-none
-├── linker.ld                   # Bare-metal kernel linker script (entry: _start, load @ 1MB)
 ├── build.sh                    # Automated build script
 ├── kvm-runner                  # Direct KVM runner binary
 ├── tdreport.bin                # Raw 64-bit binary payload
