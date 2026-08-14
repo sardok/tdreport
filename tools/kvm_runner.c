@@ -1,23 +1,23 @@
 /*
  * Direct KVM Harness for Intel TDX / Bare-Metal TDREPORT Kernel Payload
- * 
+ *
  * Exclusively targets Intel TDX (KVM_X86_TDX_VM = 5).
  * Boots bare-metal TDX payload directly using Linux /dev/kvm ioctls.
  */
 
+#include <asm/kvm_para.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/kvm.h>
+#include <linux/kvm_para.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <stdint.h>
-#include <errno.h>
-#include <signal.h>
-#include <linux/kvm.h>
-#include <linux/kvm_para.h>
-#include <asm/kvm_para.h>
+#include <unistd.h>
 
 #define LOW_MEM_SIZE (2ULL * 1024 * 1024 * 1024)
 #define FW_BASE 0xff000000ULL
@@ -68,15 +68,15 @@
 #define KVM_MEMORY_ATTRIBUTE_PRIVATE (1ULL << 3)
 #endif
 #ifndef KVM_MEM_GUEST_MEMFD
-#define KVM_MEM_GUEST_MEMFD          (1UL << 2)
+#define KVM_MEM_GUEST_MEMFD (1UL << 2)
 #endif
 
-#define TDX_TD_ATTRIBUTES_DEBUG             (1ULL << 0)
-#define TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE   (1ULL << 28)
-#define TDX_TD_ATTRIBUTES_PKS               (1ULL << 30)
-#define TDX_TD_ATTRIBUTES_PERFMON           (1ULL << 63)
+#define TDX_TD_ATTRIBUTES_DEBUG (1ULL << 0)
+#define TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE (1ULL << 28)
+#define TDX_TD_ATTRIBUTES_PKS (1ULL << 30)
+#define TDX_TD_ATTRIBUTES_PERFMON (1ULL << 63)
 
-#define KVM_TDX_MEASURE_MEMORY_REGION       (1ULL << 0)
+#define KVM_TDX_MEASURE_MEMORY_REGION (1ULL << 0)
 
 // TDX Sub-command IDs for KVM_MEMORY_ENCRYPT_OP
 enum kvm_tdx_cmd_id {
@@ -114,13 +114,13 @@ struct kvm_tdx_capabilities {
 struct kvm_tdx_init_vm {
     uint64_t attributes;
     uint64_t xfam;
-    uint64_t mrconfigid[6];    // 48 bytes SHA384
-    uint64_t mrowner[6];       // 48 bytes SHA384
+    uint64_t mrconfigid[6]; // 48 bytes SHA384
+    uint64_t mrowner[6]; // 48 bytes SHA384
     uint64_t mrownerconfig[6]; // 48 bytes SHA384
 
-    uint64_t reserved[12];     // 96 bytes padding (total 256 bytes before CPUID)
+    uint64_t reserved[12]; // 96 bytes padding (total 256 bytes before CPUID)
 
-    struct kvm_cpuid2 cpuid;   // Filtered CPUID entries
+    struct kvm_cpuid2 cpuid; // Filtered CPUID entries
 };
 
 struct kvm_tdx_init_mem_region {
@@ -129,37 +129,48 @@ struct kvm_tdx_init_mem_region {
     uint64_t nr_pages;
 };
 
-struct tdvf_metadata { uint32_t signature, length, version, nr_sections; };
+struct tdvf_metadata {
+    uint32_t signature, length, version, nr_sections;
+};
 struct tdvf_section {
     uint32_t data_offset, raw_data_size;
     uint64_t memory_address, memory_data_size;
     uint32_t type, attributes;
 };
 struct tdvf_image {
-    uint8_t *data;
+    uint8_t* data;
     long size;
-    struct tdvf_metadata *metadata;
-    struct tdvf_section *sections;
-    uint8_t *low_mem;
-    uint8_t *fw_mem;
+    struct tdvf_metadata* metadata;
+    struct tdvf_section* sections;
+    uint8_t* low_mem;
+    uint8_t* fw_mem;
     uint64_t hob_gpa;
     int low_gmem;
     int fw_gmem;
 };
-struct efi_hob_header { uint16_t type, length; uint32_t reserved; } __attribute__((packed));
+struct efi_hob_header {
+    uint16_t type, length;
+    uint32_t reserved;
+} __attribute__((packed));
 struct efi_hob_handoff {
-    struct efi_hob_header header; uint32_t version, boot_mode;
+    struct efi_hob_header header;
+    uint32_t version, boot_mode;
     uint64_t memory_top, memory_bottom, free_memory_top, free_memory_bottom, end_of_hob_list;
 } __attribute__((packed));
 struct efi_hob_resource {
-    struct efi_hob_header header; uint8_t owner[16];
+    struct efi_hob_header header;
+    uint8_t owner[16];
     uint32_t resource_type, resource_attributes;
     uint64_t physical_start, resource_length;
 } __attribute__((packed));
 
-static struct kvm_tdx_capabilities *tdx_caps = NULL;
+static struct kvm_tdx_capabilities* tdx_caps = NULL;
 static volatile sig_atomic_t watchdog_fired;
-static void watchdog_handler(int signo) { (void)signo; watchdog_fired = 1; }
+static void watchdog_handler(int signo)
+{
+    (void)signo;
+    watchdog_fired = 1;
+}
 
 static int set_private(int vm_fd, uint64_t gpa, uint64_t size, int private)
 {
@@ -167,43 +178,52 @@ static int set_private(int vm_fd, uint64_t gpa, uint64_t size, int private)
     return ioctl(vm_fd, KVM_SET_MEMORY_ATTRIBUTES, &attr);
 }
 
-static int register_gmem_slot(int vm_fd, uint32_t slot, uint64_t gpa, uint64_t size, void *host, int *gmem_fd)
+static int register_gmem_slot(int vm_fd, uint32_t slot, uint64_t gpa, uint64_t size, void* host, int* gmem_fd)
 {
     struct kvm_create_guest_memfd create = { .size = size };
     *gmem_fd = ioctl(vm_fd, KVM_CREATE_GUEST_MEMFD, &create);
-    if (*gmem_fd < 0) return -1;
+    if (*gmem_fd < 0)
+        return -1;
     struct kvm_userspace_memory_region2 region = {
-        .slot = slot, .flags = KVM_MEM_GUEST_MEMFD, .guest_phys_addr = gpa, .memory_size = size,
-        .userspace_addr = (uint64_t)(uintptr_t)host, .guest_memfd = (uint32_t)*gmem_fd,
+        .slot = slot,
+        .flags = KVM_MEM_GUEST_MEMFD,
+        .guest_phys_addr = gpa,
+        .memory_size = size,
+        .userspace_addr = (uint64_t)(uintptr_t)host,
+        .guest_memfd = (uint32_t)*gmem_fd,
     };
     return ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION2, &region);
 }
 
-static int build_hob(void *buffer, size_t size, uint64_t hob_gpa)
+static int build_hob(void* buffer, size_t size, uint64_t hob_gpa)
 {
-    uint8_t *p = buffer;
+    uint8_t* p = buffer;
     size_t need = sizeof(struct efi_hob_handoff) + 2 * sizeof(struct efi_hob_resource) + sizeof(struct efi_hob_header);
-    if (size < need) return -1;
-    struct efi_hob_handoff *hit = (void *)p;
+    if (size < need)
+        return -1;
+    struct efi_hob_handoff* hit = (void*)p;
     *hit = (struct efi_hob_handoff) { .header = { .type = 1, .length = sizeof(*hit) }, .version = 9 };
     p += sizeof(*hit);
     const uint64_t starts[] = { 0, 0x100000 }, lengths[] = { 0xa0000, LOW_MEM_SIZE - 0x100000 };
     for (unsigned i = 0; i < 2; i++) {
-        struct efi_hob_resource *r = (void *)p;
+        struct efi_hob_resource* r = (void*)p;
         *r = (struct efi_hob_resource) { .header = { .type = 3, .length = sizeof(*r) },
-            .resource_type = 7, .resource_attributes = 7, .physical_start = starts[i], .resource_length = lengths[i] };
+            .resource_type = 7,
+            .resource_attributes = 7,
+            .physical_start = starts[i],
+            .resource_length = lengths[i] };
         p += sizeof(*r);
     }
-    struct efi_hob_header *last = (void *)p;
+    struct efi_hob_header* last = (void*)p;
     *last = (struct efi_hob_header) { .type = 0xffff, .length = sizeof(*last) };
     p += sizeof(*last);
-    hit->end_of_hob_list = hob_gpa + (uint64_t)(p - (uint8_t *)buffer);
+    hit->end_of_hob_list = hob_gpa + (uint64_t)(p - (uint8_t*)buffer);
     return 0;
 }
 
-static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
+static int load_tdvf_image(int vm_fd, const char* path, struct tdvf_image* tdvf)
 {
-    FILE *file;
+    FILE* file;
     uint32_t metadata_offset;
 
     memset(tdvf, 0, sizeof(*tdvf));
@@ -215,16 +235,14 @@ static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
         perror("[-] Open TDVF image");
         return -1;
     }
-    if (fseek(file, 0, SEEK_END) || (tdvf->size = ftell(file)) < 0 ||
-        fseek(file, 0, SEEK_SET)) {
+    if (fseek(file, 0, SEEK_END) || (tdvf->size = ftell(file)) < 0 || fseek(file, 0, SEEK_SET)) {
         perror("[-] Determine TDVF image size");
         fclose(file);
         return -1;
     }
 
     tdvf->data = malloc((size_t)tdvf->size);
-    if (!tdvf->data ||
-        fread(tdvf->data, 1, (size_t)tdvf->size, file) != (size_t)tdvf->size) {
+    if (!tdvf->data || fread(tdvf->data, 1, (size_t)tdvf->size, file) != (size_t)tdvf->size) {
         perror("[-] Read TDVF image");
         fclose(file);
         return -1;
@@ -236,52 +254,41 @@ static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
         return -1;
     }
     memcpy(&metadata_offset, tdvf->data + tdvf->size - TDVF_METADATA_OFFSET,
-           sizeof(metadata_offset));
-    if ((uint64_t)metadata_offset + sizeof(struct tdvf_metadata) >
-        (uint64_t)tdvf->size) {
+        sizeof(metadata_offset));
+    if ((uint64_t)metadata_offset + sizeof(struct tdvf_metadata) > (uint64_t)tdvf->size) {
         fprintf(stderr, "[-] Invalid TDVF metadata offset\n");
         return -1;
     }
 
-    tdvf->metadata = (void *)(tdvf->data + metadata_offset);
-    if (tdvf->metadata->signature != TDVF_SIGNATURE ||
-        tdvf->metadata->version != 1 ||
-        tdvf->metadata->length != sizeof(*tdvf->metadata) +
-            tdvf->metadata->nr_sections * sizeof(struct tdvf_section) ||
-        (uint64_t)metadata_offset + tdvf->metadata->length >
-            (uint64_t)tdvf->size) {
+    tdvf->metadata = (void*)(tdvf->data + metadata_offset);
+    if (tdvf->metadata->signature != TDVF_SIGNATURE || tdvf->metadata->version != 1 || tdvf->metadata->length != sizeof(*tdvf->metadata) + tdvf->metadata->nr_sections * sizeof(struct tdvf_section) || (uint64_t)metadata_offset + tdvf->metadata->length > (uint64_t)tdvf->size) {
         fprintf(stderr, "[-] Invalid TDVF metadata\n");
         return -1;
     }
-    tdvf->sections = (void *)(tdvf->metadata + 1);
+    tdvf->sections = (void*)(tdvf->metadata + 1);
     printf("[+] Loaded TDVF %s (%ld bytes, %u sections)\n", path,
-           tdvf->size, tdvf->metadata->nr_sections);
+        tdvf->size, tdvf->metadata->nr_sections);
 
     tdvf->low_mem = mmap(NULL, LOW_MEM_SIZE, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     tdvf->fw_mem = mmap(NULL, FW_SIZE, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tdvf->low_mem == MAP_FAILED || tdvf->fw_mem == MAP_FAILED) {
         perror("[-] mmap guest memory");
         return -1;
     }
 
     for (uint32_t i = 0; i < tdvf->metadata->nr_sections; i++) {
-        struct tdvf_section *section = &tdvf->sections[i];
-        uint8_t *destination;
+        struct tdvf_section* section = &tdvf->sections[i];
+        uint8_t* destination;
 
-        if ((section->memory_address | section->memory_data_size) & 0xfff ||
-            section->raw_data_size > section->memory_data_size ||
-            (uint64_t)section->data_offset + section->raw_data_size >
-                (uint64_t)tdvf->size) {
+        if ((section->memory_address | section->memory_data_size) & 0xfff || section->raw_data_size > section->memory_data_size || (uint64_t)section->data_offset + section->raw_data_size > (uint64_t)tdvf->size) {
             fprintf(stderr, "[-] Invalid TDVF section %u\n", i);
             return -1;
         }
         if (section->memory_address + section->memory_data_size <= LOW_MEM_SIZE) {
             destination = tdvf->low_mem + section->memory_address;
-        } else if (section->memory_address >= FW_BASE &&
-                   section->memory_address + section->memory_data_size <=
-                       FW_BASE + FW_SIZE) {
+        } else if (section->memory_address >= FW_BASE && section->memory_address + section->memory_data_size <= FW_BASE + FW_SIZE) {
             destination = tdvf->fw_mem + section->memory_address - FW_BASE;
         } else {
             fprintf(stderr, "[-] TDVF section %u outside guest slots\n", i);
@@ -289,12 +296,12 @@ static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
         }
         if (section->raw_data_size) {
             memcpy(destination, tdvf->data + section->data_offset,
-                   section->raw_data_size);
+                section->raw_data_size);
         }
         if (section->type == TDVF_SECTION_HOB) {
             tdvf->hob_gpa = section->memory_address;
             if (build_hob(destination, section->memory_data_size,
-                          tdvf->hob_gpa)) {
+                    tdvf->hob_gpa)) {
                 fprintf(stderr, "[-] Failed to build TDVF HOB\n");
                 return -1;
             }
@@ -306,14 +313,13 @@ static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
     }
 
     if (register_gmem_slot(vm_fd, 0, 0, LOW_MEM_SIZE, tdvf->low_mem,
-                           &tdvf->low_gmem) ||
-        register_gmem_slot(vm_fd, 1, FW_BASE, FW_SIZE, tdvf->fw_mem,
-                           &tdvf->fw_gmem)) {
+            &tdvf->low_gmem)
+        || register_gmem_slot(vm_fd, 1, FW_BASE, FW_SIZE, tdvf->fw_mem,
+            &tdvf->fw_gmem)) {
         perror("[-] Register guest memory");
         return -1;
     }
-    if (set_private(vm_fd, 0, LOW_MEM_SIZE, 1) ||
-        set_private(vm_fd, FW_BASE, FW_SIZE, 1)) {
+    if (set_private(vm_fd, 0, LOW_MEM_SIZE, 1) || set_private(vm_fd, FW_BASE, FW_SIZE, 1)) {
         perror("[-] Set private memory");
         return -1;
     }
@@ -322,7 +328,8 @@ static int load_tdvf_image(int vm_fd, const char *path, struct tdvf_image *tdvf)
 }
 
 // Helper to call KVM_MEMORY_ENCRYPT_OP with struct kvm_tdx_cmd
-static int tdx_cmd(int fd, uint32_t cmd_id, uint32_t flags, void *data) {
+static int tdx_cmd(int fd, uint32_t cmd_id, uint32_t flags, void* data)
+{
     struct kvm_tdx_cmd cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.id = cmd_id;
@@ -341,15 +348,14 @@ static int tdx_cmd(int fd, uint32_t cmd_id, uint32_t flags, void *data) {
  */
 static int get_tdx_capabilities(int vm_fd)
 {
-    struct kvm_tdx_capabilities *caps;
+    struct kvm_tdx_capabilities* caps;
     int nr_cpuid_configs = 6;
     size_t size;
     int r;
 
     do {
-        size = sizeof(struct kvm_tdx_capabilities) +
-                      nr_cpuid_configs * sizeof(struct kvm_cpuid_entry2);
-        caps = (struct kvm_tdx_capabilities *)calloc(1, size);
+        size = sizeof(struct kvm_tdx_capabilities) + nr_cpuid_configs * sizeof(struct kvm_cpuid_entry2);
+        caps = (struct kvm_tdx_capabilities*)calloc(1, size);
         if (!caps) {
             return -ENOMEM;
         }
@@ -375,21 +381,20 @@ static int get_tdx_capabilities(int vm_fd)
 
     printf("[+] get_tdx_capabilities succeeded! (cpuid nent=%u)\n", tdx_caps->cpuid.nent);
     printf("    supported_attrs = 0x%llx, supported_xfam = 0x%llx\n",
-           (unsigned long long)tdx_caps->supported_attrs,
-           (unsigned long long)tdx_caps->supported_xfam);
+        (unsigned long long)tdx_caps->supported_attrs,
+        (unsigned long long)tdx_caps->supported_xfam);
 
     return 0;
 }
 
 /* Find matching entry for function/index on kvm_cpuid2 struct */
-static struct kvm_cpuid_entry2 *cpuid_find_entry(struct kvm_cpuid2 *cpuid,
-                                                 uint32_t function,
-                                                 uint32_t index)
+static struct kvm_cpuid_entry2* cpuid_find_entry(struct kvm_cpuid2* cpuid,
+    uint32_t function,
+    uint32_t index)
 {
     uint32_t i;
     for (i = 0; i < cpuid->nent; ++i) {
-        if (cpuid->entries[i].function == function &&
-            cpuid->entries[i].index == index) {
+        if (cpuid->entries[i].function == function && cpuid->entries[i].index == index) {
             return &cpuid->entries[i];
         }
     }
@@ -397,7 +402,7 @@ static struct kvm_cpuid_entry2 *cpuid_find_entry(struct kvm_cpuid2 *cpuid,
 }
 
 /* Filter guest CPUID entries against tdx_caps->cpuid */
-static void tdx_filter_cpuid(struct kvm_cpuid2 *cpuids)
+static void tdx_filter_cpuid(struct kvm_cpuid2* cpuids)
 {
     int i, dest_cnt = 0;
     struct kvm_cpuid_entry2 *src, *dest, *conf;
@@ -425,10 +430,9 @@ static void tdx_filter_cpuid(struct kvm_cpuid2 *cpuids)
 
 static int configure_vcpu(int kvm_fd, int vm_fd, uint64_t hob_gpa)
 {
-    size_t cpuid_size = sizeof(struct kvm_cpuid2) +
-                        512 * sizeof(struct kvm_cpuid_entry2);
-    struct kvm_cpuid2 *cpuid;
-    struct kvm_cpuid_entry2 *leaf1;
+    size_t cpuid_size = sizeof(struct kvm_cpuid2) + 512 * sizeof(struct kvm_cpuid_entry2);
+    struct kvm_cpuid2* cpuid;
+    struct kvm_cpuid_entry2* leaf1;
     int vcpu_fd;
 
     printf("[+] Creating TDX vCPU (KVM_CREATE_VCPU)...\n");
@@ -462,7 +466,7 @@ static int configure_vcpu(int kvm_fd, int vm_fd, uint64_t hob_gpa)
     }
     leaf1->ecx |= 1U << 21; /* TDX vCPUs require x2APIC. */
     printf("[+] Installing full vCPU CPUID (%u entries, x2APIC=%u).\n",
-           cpuid->nent, !!(leaf1->ecx & (1U << 21)));
+        cpuid->nent, !!(leaf1->ecx & (1U << 21)));
     if (ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid) < 0) {
         perror("[-] KVM_SET_CPUID2");
         free(cpuid);
@@ -472,13 +476,14 @@ static int configure_vcpu(int kvm_fd, int vm_fd, uint64_t hob_gpa)
     free(cpuid);
 
     if (tdx_cmd(vcpu_fd, KVM_TDX_INIT_VCPU, 0,
-                (void *)(uintptr_t)hob_gpa) < 0) {
+            (void*)(uintptr_t)hob_gpa)
+        < 0) {
         perror("[-] KVM_TDX_INIT_VCPU");
         close(vcpu_fd);
         return -1;
     }
     printf("[+] KVM_TDX_INIT_VCPU succeeded (HOB GPA 0x%llx).\n",
-           (unsigned long long)hob_gpa);
+        (unsigned long long)hob_gpa);
     return vcpu_fd;
 }
 
@@ -514,8 +519,9 @@ static int initialize_tdvf_memory(int vcpu_fd, const struct tdvf_image* tdvf)
     return 0;
 }
 
-int main(int argc, char **argv) {
-    const char *payload_path = "td-shim-tdreport.bin";
+int main(int argc, char** argv)
+{
+    const char* payload_path = "td-shim-tdreport.bin";
     if (argc > 1) {
         payload_path = argv[1];
     }
@@ -582,7 +588,10 @@ int main(int argc, char **argv) {
     }
 
     struct kvm_enable_cap hypercall_cap = { .cap = KVM_CAP_EXIT_HYPERCALL, .args = { 1ULL << KVM_HC_MAP_GPA_RANGE } };
-    if (ioctl(vm_fd, KVM_ENABLE_CAP, &hypercall_cap) < 0) { perror("[-] Enable KVM_HC_MAP_GPA_RANGE exits"); return 1; }
+    if (ioctl(vm_fd, KVM_ENABLE_CAP, &hypercall_cap) < 0) {
+        perror("[-] Enable KVM_HC_MAP_GPA_RANGE exits");
+        return 1;
+    }
 
     // Step 10c: Fetch TDX capabilities
     printf("[+] Fetching hardware TDX capabilities (get_tdx_capabilities)...\n");
@@ -596,7 +605,7 @@ int main(int argc, char **argv) {
     // Step 10d: Initialize TDX VM
     printf("[+] Initializing TDX VM (KVM_TDX_INIT_VM)...\n");
     size_t init_sz = sizeof(struct kvm_tdx_init_vm) + 512 * sizeof(struct kvm_cpuid_entry2);
-    struct kvm_tdx_init_vm *init_vm = (struct kvm_tdx_init_vm *)calloc(1, init_sz);
+    struct kvm_tdx_init_vm* init_vm = (struct kvm_tdx_init_vm*)calloc(1, init_sz);
 
     if (tdx_caps) {
         init_vm->attributes = 0;
@@ -620,9 +629,9 @@ int main(int argc, char **argv) {
 
     if (res == 0) {
         printf("[+] KVM_TDX_INIT_VM succeeded! (attributes=0x%llx, xfam=0x%llx, cpuid nent=%u)\n",
-               (unsigned long long)init_vm->attributes,
-               (unsigned long long)init_vm->xfam,
-               init_vm->cpuid.nent);
+            (unsigned long long)init_vm->attributes,
+            (unsigned long long)init_vm->xfam,
+            init_vm->cpuid.nent);
     } else {
         fprintf(stderr, "[-] KVM_TDX_INIT_VM failed: %s (errno=%d)\n", strerror(errno), errno);
         free(init_vm);
@@ -671,7 +680,7 @@ int main(int argc, char **argv) {
         close(kvm_fd);
         return 1;
     }
-    struct kvm_run *run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
+    struct kvm_run* run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
     if (run == MAP_FAILED) {
         perror("[-] mmap kvm_run failed");
         close(vcpu_fd);
@@ -698,79 +707,83 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[-] Guest made no userspace-visible progress for 60 seconds; guest execution is likely halted.\n");
                 break;
             }
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
             perror("[-] KVM_RUN execution failed");
             break;
         }
 
         switch (run->exit_reason) {
-            case KVM_EXIT_HYPERCALL:
-                if (run->hypercall.nr != KVM_HC_MAP_GPA_RANGE) { fprintf(stderr, "[-] Unexpected hypercall %llu\n", (unsigned long long)run->hypercall.nr); goto done; }
-                {
-                    uint64_t gpa = run->hypercall.args[0];
-                    uint64_t size = run->hypercall.args[1] << 12;
-                    int private = !!(run->hypercall.args[2] & KVM_MAP_GPA_RANGE_ENCRYPTED);
-                    run->hypercall.ret = set_private(vm_fd, gpa, size, private) ? -errno : 0;
-                }
-                break;
+        case KVM_EXIT_HYPERCALL:
+            if (run->hypercall.nr != KVM_HC_MAP_GPA_RANGE) {
+                fprintf(stderr, "[-] Unexpected hypercall %llu\n", (unsigned long long)run->hypercall.nr);
+                goto done;
+            }
+            {
+                uint64_t gpa = run->hypercall.args[0];
+                uint64_t size = run->hypercall.args[1] << 12;
+                int private = !!(run->hypercall.args[2] & KVM_MAP_GPA_RANGE_ENCRYPTED);
+                run->hypercall.ret = set_private(vm_fd, gpa, size, private) ? -errno : 0;
+            }
+            break;
 #ifdef KVM_EXIT_MEMORY_FAULT
-            case KVM_EXIT_MEMORY_FAULT:
-                if (set_private(vm_fd, run->memory_fault.gpa, run->memory_fault.size,
-                                !!(run->memory_fault.flags & KVM_MEMORY_EXIT_FLAG_PRIVATE))) {
-                    perror("[-] Resolve KVM_EXIT_MEMORY_FAULT"); goto done;
-                }
-                break;
+        case KVM_EXIT_MEMORY_FAULT:
+            if (set_private(vm_fd, run->memory_fault.gpa, run->memory_fault.size,
+                    !!(run->memory_fault.flags & KVM_MEMORY_EXIT_FLAG_PRIVATE))) {
+                perror("[-] Resolve KVM_EXIT_MEMORY_FAULT");
+                goto done;
+            }
+            break;
 #endif
-            case KVM_EXIT_IO:
-                // Intercept COM1 serial output and payload completion.
-                if (run->io.direction == KVM_EXIT_IO_OUT && run->io.port == 0x3f8) {
-                    char *p = (char *)run + run->io.data_offset;
-                    for (uint32_t i = 0; i < run->io.count; i++) {
-                        putchar(p[i]);
-                    }
-                    fflush(stdout);
-                } else if (run->io.direction == KVM_EXIT_IO_OUT &&
-                           run->io.port == 0xf4 && run->io.size == 1 &&
-                           run->io.count >= 1) {
-                    uint8_t status = *((uint8_t *)run + run->io.data_offset);
-                    printf("\n------------------------------------------------------------\n");
-                    if (status == 0)
-                        printf("[+] Guest payload completed successfully.\n");
-                    else
-                        printf("[-] Guest payload reported failure (status=%u).\n", status);
-                    goto done;
+        case KVM_EXIT_IO:
+            // Intercept COM1 serial output and payload completion.
+            if (run->io.direction == KVM_EXIT_IO_OUT && run->io.port == 0x3f8) {
+                char* p = (char*)run + run->io.data_offset;
+                for (uint32_t i = 0; i < run->io.count; i++) {
+                    putchar(p[i]);
                 }
-                break;
-            case KVM_EXIT_SHUTDOWN:
+                fflush(stdout);
+            } else if (run->io.direction == KVM_EXIT_IO_OUT && run->io.port == 0xf4 && run->io.size == 1 && run->io.count >= 1) {
+                uint8_t status = *((uint8_t*)run + run->io.data_offset);
                 printf("\n------------------------------------------------------------\n");
-                printf("[+] KVM Intercepted Guest Shutdown / Triple Fault (KVM_EXIT_SHUTDOWN).\n");
+                if (status == 0)
+                    printf("[+] Guest payload completed successfully.\n");
+                else
+                    printf("[-] Guest payload reported failure (status=%u).\n", status);
                 goto done;
-            case KVM_EXIT_EXCEPTION:
-                printf("\n------------------------------------------------------------\n");
-                printf("[+] KVM Intercepted Guest Exception (vector=%u, error_code=%u).\n",
-                       run->ex.exception, run->ex.error_code);
-                goto done;
-            case KVM_EXIT_HLT:
-                printf("\n------------------------------------------------------------\n");
-                printf("[+] Guest CPU halted cleanly (KVM_EXIT_HLT).\n");
-                goto done;
-            case KVM_EXIT_FAIL_ENTRY:
-                printf("\n[-] KVM_EXIT_FAIL_ENTRY (hardware_entry_failure_reason = 0x%llx)\n",
-                       (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
-                goto done;
-            case KVM_EXIT_INTERNAL_ERROR:
-                printf("\n[-] KVM_EXIT_INTERNAL_ERROR (suberror = 0x%x)\n",
-                       run->internal.suberror);
-                goto done;
-            default:
-                printf("\n[i] KVM exit_reason = 0x%x\n", run->exit_reason);
-                goto done;
+            }
+            break;
+        case KVM_EXIT_SHUTDOWN:
+            printf("\n------------------------------------------------------------\n");
+            printf("[+] KVM Intercepted Guest Shutdown / Triple Fault (KVM_EXIT_SHUTDOWN).\n");
+            goto done;
+        case KVM_EXIT_EXCEPTION:
+            printf("\n------------------------------------------------------------\n");
+            printf("[+] KVM Intercepted Guest Exception (vector=%u, error_code=%u).\n",
+                run->ex.exception, run->ex.error_code);
+            goto done;
+        case KVM_EXIT_HLT:
+            printf("\n------------------------------------------------------------\n");
+            printf("[+] Guest CPU halted cleanly (KVM_EXIT_HLT).\n");
+            goto done;
+        case KVM_EXIT_FAIL_ENTRY:
+            printf("\n[-] KVM_EXIT_FAIL_ENTRY (hardware_entry_failure_reason = 0x%llx)\n",
+                (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+            goto done;
+        case KVM_EXIT_INTERNAL_ERROR:
+            printf("\n[-] KVM_EXIT_INTERNAL_ERROR (suberror = 0x%x)\n",
+                run->internal.suberror);
+            goto done;
+        default:
+            printf("\n[i] KVM exit_reason = 0x%x\n", run->exit_reason);
+            goto done;
         }
     }
 
 done:
     alarm(0);
-    if (tdx_caps) free(tdx_caps);
+    if (tdx_caps)
+        free(tdx_caps);
     close(vcpu_fd);
     close(vm_fd);
     close(kvm_fd);
