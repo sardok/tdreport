@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-mod serial;
+mod console;
 mod tdx;
 
 use td_payload as _;
@@ -14,15 +14,12 @@ use td_payload as _;
 /// Entry point called by td-shim or reset bootloader in 64-bit long mode.
 #[no_mangle]
 pub extern "C" fn main() -> ! {
-    // 1. Initialize COM1 Serial port (0x3F8) for debugging output
-    serial::init_serial();
-
     println!();
     println!("************************************************************");
     println!("*   Intel TDX Bare-Metal Firmware/Kernel Payload Initialized *");
     println!("************************************************************");
     println!("[+] Firmware payload loaded at 64-bit long mode.");
-    println!("[+] Serial console initialized at COM1 (0x3F8).");
+    println!("[+] Console output routed through TDX VMCALL I/O at COM1 (0x3F8).");
 
     // 2. Prepare 64-byte user REPORTDATA nonce
     let mut report_data: tdx::ReportData = [0u8; 64];
@@ -65,4 +62,3 @@ pub extern "C" fn main() -> ! {
         tdx_tdcall::tdx::tdvmcall_halt();
     }
 }
-
