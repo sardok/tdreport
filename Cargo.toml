@@ -1,14 +1,8 @@
-[package]
-name = "tdreport"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-x86_64 = { version = "0.15.0", default-features = false, features = ["instructions"] }
-spin = "0.9.8"
-tdx-tdcall = { path = "third_party/td-shim/tdx-tdcall" }
-td-payload = { path = "third_party/td-shim/td-payload", default-features = false, features = ["tdx", "start", "no-shared-mem", "no-interrupt"] }
-
-
-
-
+[workspace]
+members = [
+    "kvm-runner",
+    "td-payload-report",
+]
+default-members = ["kvm-runner"]
+exclude = ["third_party/td-shim"]
+resolver = "2"

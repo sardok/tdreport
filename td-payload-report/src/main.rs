@@ -12,7 +12,7 @@ mod tdx;
 use td_payload as _;
 
 /// Entry point called by td-shim or reset bootloader in 64-bit long mode.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
     println!();
     println!("************************************************************");
