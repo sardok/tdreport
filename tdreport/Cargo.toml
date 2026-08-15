@@ -1,0 +1,13 @@
+[package]
+name = "tdreport"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+kvm-runner = { path = "../kvm-runner" }
+log = "0.4"
+tdx-tdcall = { path = "../third_party/td-shim/tdx-tdcall" }

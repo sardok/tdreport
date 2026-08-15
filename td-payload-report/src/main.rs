@@ -31,12 +31,14 @@ pub extern "C" fn main() -> ! {
 
     // 3. Issue TDCALL[TDG.MR.REPORT]
     println!("[+] Executing TDCALL[TDG.MR.REPORT] (Leaf 4)...");
-    
+
     let exit_status = match tdx::get_td_report(&report_data) {
         Ok(report) => {
             println!("[+] TDCALL SUCCESS! Status code 0 (TDX_SUCCESS).");
             println!("[+] Parsing TDREPORT structure...");
             tdx::print_td_report(&report);
+            tdx::send_td_report(&report);
+            println!("[+] Sent raw TDREPORT to host over I/O port 0x500.");
             println!("[+] Intel TDX TDREPORT retrieval successfully completed!");
             0u8
         }

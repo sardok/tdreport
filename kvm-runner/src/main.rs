@@ -13,7 +13,7 @@ struct Cli {
 
 fn try_main() -> Result<()> {
     let cli = Cli::parse();
-    kvm_runner::run(cli.filename)
+    kvm_runner::run_file(cli.filename).map(|_| ())
 }
 
 fn main() {

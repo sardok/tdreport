@@ -5,7 +5,7 @@
 //! here is represented explicitly with `#[repr(C)]` structures.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
@@ -52,6 +52,9 @@ const KVM_EXIT_FAIL_ENTRY: u32 = 9;
 const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
 const KVM_EXIT_MEMORY_FAULT: u32 = 39;
 const KVM_EXIT_IO_OUT: u8 = 1;
+const TD_REPORT_IO_PORT: u16 = 0x500;
+pub const TD_REPORT_SIZE: usize = 1024;
+pub type TdReport = [u8; TD_REPORT_SIZE];
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -273,7 +276,6 @@ impl Drop for Mapping {
 }
 
 struct TdvfImage {
-    _data: Vec<u8>,
     sections: Vec<TdvfSection>,
     low_mem: Mapping,
     fw_mem: Mapping,
@@ -525,9 +527,7 @@ fn build_hob(buffer: &mut [u8], hob_gpa: u64) -> Result<()> {
     Ok(())
 }
 
-fn load_tdvf_image(vm_fd: RawFd, path: &Path) -> Result<TdvfImage> {
-    let mut data = Vec::new();
-    File::open(path)?.read_to_end(&mut data)?;
+fn load_tdvf_image(vm_fd: RawFd, data: &[u8]) -> Result<TdvfImage> {
     if data.len() < TDVF_METADATA_OFFSET + 4 {
         bail!("TDVF image too small");
     }
@@ -574,8 +574,7 @@ fn load_tdvf_image(vm_fd: RawFd, path: &Path) -> Result<TdvfImage> {
         });
     }
     debug!(
-        "[+] Loaded TDVF {} ({} bytes, {} sections)",
-        path.display(),
+        "[+] Loaded embedded TDVF ({} bytes, {} sections)",
         data.len(),
         sections.len()
     );
@@ -631,7 +630,6 @@ fn load_tdvf_image(vm_fd: RawFd, path: &Path) -> Result<TdvfImage> {
     debug!("[+] Registered 2 GiB low RAM and 16 MiB TDVF firmware as private memory.");
 
     Ok(TdvfImage {
-        _data: data,
         sections,
         low_mem,
         fw_mem,
@@ -846,12 +844,13 @@ fn write_native_i64(address: *mut u8, value: i64) {
     unsafe { ptr::write_unaligned(address.cast(), value) };
 }
 
-fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<()> {
+fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<TdReport> {
     let mmap_size = ioctl_none(kvm_fd, KVM_GET_VCPU_MMAP_SIZE)? as usize;
     let run = Mapping::shared(vcpu_fd, mmap_size)?;
     debug!("[+] TDX vCPU ready for execution!");
     debug!("[+] Executing guest CPU run loop (capturing COM1 UART 0x3F8 I/O exits)...");
     debug!("------------------------------------------------------------");
+    let mut td_report = Vec::with_capacity(TD_REPORT_SIZE);
 
     // SAFETY: the zeroed sigaction is initialized before installation.  The
     // handler only performs an atomic store, which is async-signal-safe.  No
@@ -934,11 +933,31 @@ fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<()> {
                 if direction == KVM_EXIT_IO_OUT && port == 0x3f8 {
                     io::stdout().write_all(bytes)?;
                     io::stdout().flush()?;
+                } else if direction == KVM_EXIT_IO_OUT && port == TD_REPORT_IO_PORT && size == 1 {
+                    if td_report
+                        .len()
+                        .checked_add(bytes.len())
+                        .filter(|len| *len <= TD_REPORT_SIZE)
+                        .is_none()
+                    {
+                        bail!("guest sent more than {TD_REPORT_SIZE} TDREPORT bytes");
+                    }
+                    td_report.extend_from_slice(bytes);
                 } else if direction == KVM_EXIT_IO_OUT && port == 0xf4 && size == 1 && count >= 1 {
                     debug!("\n------------------------------------------------------------");
                     if bytes[0] == 0 {
-                        debug!("[+] Guest payload completed successfully.");
-                        return Ok(());
+                        if td_report.len() != TD_REPORT_SIZE {
+                            bail!(
+                                "guest completed after sending {} of {TD_REPORT_SIZE} TDREPORT bytes",
+                                td_report.len()
+                            );
+                        }
+                        debug!(
+                            "[+] Guest payload completed successfully with a complete TDREPORT."
+                        );
+                        return td_report
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("invalid TDREPORT length"));
                     }
                     bail!("guest payload reported failure (status={})", bytes[0]);
                 }
@@ -946,7 +965,7 @@ fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<()> {
             KVM_EXIT_SHUTDOWN => {
                 debug!("\n------------------------------------------------------------");
                 debug!("[+] KVM Intercepted Guest Shutdown / Triple Fault (KVM_EXIT_SHUTDOWN).");
-                return Ok(());
+                bail!("guest shut down before completing the TDREPORT transfer");
             }
             KVM_EXIT_EXCEPTION => {
                 let vector = native_u32(union);
@@ -956,7 +975,7 @@ fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<()> {
             KVM_EXIT_HLT => {
                 debug!("\n------------------------------------------------------------");
                 debug!("[+] Guest CPU halted cleanly (KVM_EXIT_HLT).");
-                return Ok(());
+                bail!("guest halted before completing the TDREPORT transfer");
             }
             KVM_EXIT_FAIL_ENTRY => {
                 bail!(
@@ -975,9 +994,8 @@ fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<()> {
     }
 }
 
-/// Run a TDVF image in a minimal Intel TDX VM and forward its console output.
-pub fn run(payload_path: impl AsRef<Path>) -> Result<()> {
-    let payload_path = payload_path.as_ref();
+/// Run an in-memory TDVF image in a minimal Intel TDX VM and forward its console output.
+pub fn run_image(image: &[u8]) -> Result<TdReport> {
     debug!("============================================================");
     debug!("     Direct KVM Runner for Intel TDX Bare-Metal Payload");
     debug!("============================================================");
@@ -995,7 +1013,7 @@ pub fn run(payload_path: impl AsRef<Path>) -> Result<()> {
         vm.as_raw_fd()
     );
 
-    let tdvf = load_tdvf_image(vm.as_raw_fd(), payload_path)?;
+    let tdvf = load_tdvf_image(vm.as_raw_fd(), image)?;
 
     let mut split_irqchip = KvmEnableCap {
         cap: KVM_CAP_SPLIT_IRQCHIP,
@@ -1047,9 +1065,25 @@ pub fn run(payload_path: impl AsRef<Path>) -> Result<()> {
     tdx_cmd(vm.as_raw_fd(), KVM_TDX_FINALIZE_VM, 0, ptr::null_mut())?;
     debug!("[+] KVM_TDX_FINALIZE_VM finalized VM to RUNNABLE state!");
 
-    run_vcpu(kvm.as_raw_fd(), vm.as_raw_fd(), vcpu.as_raw_fd())?;
+    let report = run_vcpu(kvm.as_raw_fd(), vm.as_raw_fd(), vcpu.as_raw_fd())?;
     debug!("============================================================");
-    Ok(())
+    Ok(report)
+}
+
+/// Read a TDVF image from a file and run it in a minimal Intel TDX VM.
+pub fn run_file(payload_path: impl AsRef<Path>) -> Result<TdReport> {
+    let image = std::fs::read(payload_path.as_ref()).with_context(|| {
+        format!(
+            "failed to read TDVF image {}",
+            payload_path.as_ref().display()
+        )
+    })?;
+    run_image(&image)
+}
+
+/// Backwards-compatible alias for [`run_file`].
+pub fn run(payload_path: impl AsRef<Path>) -> Result<TdReport> {
+    run_file(payload_path)
 }
 
 #[cfg(test)]

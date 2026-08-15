@@ -2,6 +2,7 @@
 members = [
     "kvm-runner",
     "td-payload-report",
+    "tdreport",
 ]
 default-members = ["kvm-runner"]
 exclude = ["third_party/td-shim"]

@@ -10,5 +10,5 @@ tdx-tdcall = { path = "../third_party/td-shim/tdx-tdcall" }
 td-payload = { path = "../third_party/td-shim/td-payload", default-features = false, features = ["tdx", "start", "no-shared-mem", "no-interrupt"] }
 
 [[bin]]
-name = "tdreport"
+name = "td-payload-report"
 path = "src/main.rs"

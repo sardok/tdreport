@@ -13,7 +13,7 @@ cargo build --release --target x86_64-unknown-none \
     -p td-payload-report
 
 # 3. Extract raw binary format from ELF
-objcopy -O binary target/x86_64-unknown-none/release/tdreport tdreport.bin
+objcopy -O binary target/x86_64-unknown-none/release/td-payload-report td-payload-report.bin
 
 # 4. Build a td-shim TDVF containing the ELF payload
 if [ -d third_party/td-shim ]; then
@@ -22,7 +22,7 @@ if [ -d third_party/td-shim ]; then
         CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu RUSTFLAGS= \
         CC=clang AR=ar CC_x86_64_unknown_none=clang AR_x86_64_unknown_none=ar \
         cargo image -t executable \
-          -p ../../target/x86_64-unknown-none/release/tdreport \
+          -p ../../target/x86_64-unknown-none/release/td-payload-report \
           --release --log-level off -o ../../td-shim-tdreport.bin
     )
 fi
@@ -33,10 +33,18 @@ cargo build --release --target x86_64-unknown-linux-gnu \
 cp target/x86_64-unknown-linux-gnu/release/kvm-runner \
    ./kvm-runner.bin
 
+# 6. Embed the generated TDVF in the final user-facing executable.
+TDREPORT_TDVF_PATH="$PWD/td-shim-tdreport.bin" \
+cargo build --release --target x86_64-unknown-linux-gnu \
+    -p tdreport
+cp target/x86_64-unknown-linux-gnu/release/tdreport \
+   ./tdreport.bin
+
 echo "============================================================"
 echo " Build Completed Successfully!                              "
 echo " Generated artifacts:                                       "
-echo "  1. tdreport.bin (Raw 64-bit binary payload, $(wc -c < tdreport.bin) bytes)"
+echo "  1. td-payload-report.bin (Raw 64-bit binary payload, $(wc -c < td-payload-report.bin) bytes)"
 echo "  2. td-shim-tdreport.bin (TDVF plus executable payload)"
 echo "  3. kvm-runner.bin (Rust direct KVM runner binary)"
+echo "  4. tdreport.bin (self-contained TDREPORT executable)"
 echo "============================================================"
