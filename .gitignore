@@ -1,2 +1,3 @@
 /target
 *.bin
+!tdreport/assets/td-shim-tdreport.bin

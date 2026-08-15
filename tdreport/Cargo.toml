@@ -3,6 +3,12 @@ name = "tdreport"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+include = [
+    "src/**",
+    "assets/td-shim-tdreport.bin",
+    "build.rs",
+    "Cargo.toml",
+]
 
 [dependencies]
 anyhow = "1"

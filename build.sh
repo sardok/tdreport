@@ -27,6 +27,9 @@ if [ -d third_party/td-shim ]; then
     )
 fi
 
+# Refresh the TDVF packaged with the reusable tdreport crate.
+cp td-shim-tdreport.bin tdreport/assets/td-shim-tdreport.bin
+
 # 5. Compile the Rust KVM runner workspace package and copy the artifact.
 cargo build --release --target x86_64-unknown-linux-gnu \
     -p kvm-runner
@@ -34,7 +37,6 @@ cp target/x86_64-unknown-linux-gnu/release/kvm-runner \
    ./kvm-runner.bin
 
 # 6. Embed the generated TDVF in the final user-facing executable.
-TDREPORT_TDVF_PATH="$PWD/td-shim-tdreport.bin" \
 cargo build --release --target x86_64-unknown-linux-gnu \
     -p tdreport
 cp target/x86_64-unknown-linux-gnu/release/tdreport \
