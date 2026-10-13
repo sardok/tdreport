@@ -7,7 +7,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::ptr;
 use std::slice;
@@ -373,7 +373,7 @@ impl Mapping {
         })
     }
 
-    fn shared(fd: RawFd, size: usize) -> Result<Self> {
+    fn shared(fd: BorrowedFd<'_>, size: usize) -> Result<Self> {
         // SAFETY: KVM exposes a shared kvm_run mapping at offset zero.
         let address = unsafe {
             libc::mmap(
@@ -381,7 +381,7 @@ impl Mapping {
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
@@ -446,12 +446,10 @@ struct CpuidSet {
 }
 
 impl CpuidSet {
-    fn supported(kvm_fd: RawFd, capacity: usize) -> Result<Self> {
+    fn supported(kvm_fd: BorrowedFd<'_>, capacity: usize) -> Result<Self> {
         let mut buffer = vec![0u8; size_of::<KvmCpuid2>() + capacity * size_of::<KvmCpuidEntry2>()];
         write_u32(&mut buffer, 0, capacity as u32)?;
-        // SAFETY: callers keep the KVM descriptor open throughout this call.
-        let kvm = unsafe { BorrowedFd::borrow_raw(kvm_fd) };
-        get_supported_cpuid(kvm, &mut buffer)?;
+        get_supported_cpuid(kvm_fd, &mut buffer)?;
         let count = read_u32(&buffer, 0)? as usize;
         if count > capacity {
             bail!("KVM returned too many CPUID entries");
@@ -537,15 +535,13 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<()> {
     Ok(())
 }
 
-fn tdx_cmd(fd: RawFd, id: u32, flags: u32, data: *mut libc::c_void) -> Result<()> {
+fn tdx_cmd(fd: BorrowedFd<'_>, id: u32, flags: u32, data: *mut libc::c_void) -> Result<()> {
     let mut command = KvmTdxCmd {
         id,
         flags,
         data: data as u64,
         hw_error: 0,
     };
-    // SAFETY: callers keep the VM or vCPU descriptor open throughout this call.
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     match memory_encrypt_opt(fd, &mut command).map_err(io::Error::from) {
         Ok(_) => Ok(()),
         Err(error) => {
@@ -560,7 +556,7 @@ fn tdx_cmd(fd: RawFd, id: u32, flags: u32, data: *mut libc::c_void) -> Result<()
     }
 }
 
-fn set_private(vm_fd: RawFd, gpa: u64, size: u64, private: bool) -> Result<()> {
+fn set_private(vm_fd: BorrowedFd<'_>, gpa: u64, size: u64, private: bool) -> Result<()> {
     let attributes = KvmMemoryAttributes {
         address: gpa,
         size,
@@ -571,14 +567,12 @@ fn set_private(vm_fd: RawFd, gpa: u64, size: u64, private: bool) -> Result<()> {
         },
         flags: 0,
     };
-    // SAFETY: callers keep the VM descriptor open for the duration of this call.
-    let vm = unsafe { BorrowedFd::borrow_raw(vm_fd) };
-    set_memory_attributes(vm, &attributes).map_err(io::Error::from)?;
+    set_memory_attributes(vm_fd, &attributes).map_err(io::Error::from)?;
     Ok(())
 }
 
 fn register_gmem_slot(
-    vm_fd: RawFd,
+    vm_fd: BorrowedFd<'_>,
     slot: u32,
     gpa: u64,
     size: u64,
@@ -588,8 +582,7 @@ fn register_gmem_slot(
         size,
         ..Default::default()
     };
-    let vm = unsafe { BorrowedFd::borrow_raw(vm_fd) };
-    let guest_memfd = create_guest_memfd(vm, &mut create).map_err(io::Error::from)?;
+    let guest_memfd = create_guest_memfd(vm_fd, &mut create).map_err(io::Error::from)?;
     let region = KvmUserspaceMemoryRegion2 {
         slot,
         flags: KVM_MEM_GUEST_MEMFD,
@@ -599,7 +592,7 @@ fn register_gmem_slot(
         guest_memfd: guest_memfd.as_raw_fd() as u32,
         ..Default::default()
     };
-    set_user_memory_region2(vm, &region).map_err(io::Error::from)?;
+    set_user_memory_region2(vm_fd, &region).map_err(io::Error::from)?;
     Ok(guest_memfd)
 }
 
@@ -636,7 +629,7 @@ fn build_hob(buffer: &mut [u8], hob_gpa: u64) -> Result<()> {
     Ok(())
 }
 
-fn load_tdvf_image(vm_fd: RawFd, data: &[u8]) -> Result<TdvfImage> {
+fn load_tdvf_image(vm_fd: BorrowedFd<'_>, data: &[u8]) -> Result<TdvfImage> {
     if data.len() < TDVF_METADATA_OFFSET + 4 {
         bail!("TDVF image too small");
     }
@@ -747,7 +740,7 @@ fn load_tdvf_image(vm_fd: RawFd, data: &[u8]) -> Result<TdvfImage> {
     })
 }
 
-fn get_tdx_capabilities(vm_fd: RawFd) -> Result<TdxCapabilities> {
+fn get_tdx_capabilities(vm_fd: BorrowedFd<'_>) -> Result<TdxCapabilities> {
     const CAP_CPUID_OFFSET: usize = 2048;
     let mut capacity = 6usize;
     loop {
@@ -799,7 +792,11 @@ fn get_tdx_capabilities(vm_fd: RawFd) -> Result<TdxCapabilities> {
     }
 }
 
-fn initialize_tdx_vm(kvm_fd: RawFd, vm_fd: RawFd, caps: &TdxCapabilities) -> Result<()> {
+fn initialize_tdx_vm(
+    kvm_fd: BorrowedFd<'_>,
+    vm_fd: BorrowedFd<'_>,
+    caps: &TdxCapabilities,
+) -> Result<()> {
     let mut cpuid = CpuidSet::supported(kvm_fd, 512)?;
     cpuid.entries.retain_mut(|entry| {
         let Some(config) = caps
@@ -860,7 +857,7 @@ fn initialize_tdx_vm(kvm_fd: RawFd, vm_fd: RawFd, caps: &TdxCapabilities) -> Res
     Ok(())
 }
 
-fn configure_vcpu(kvm_fd: RawFd, vm_fd: BorrowedFd<'_>, hob_gpa: u64) -> Result<OwnedFd> {
+fn configure_vcpu(kvm_fd: BorrowedFd<'_>, vm_fd: BorrowedFd<'_>, hob_gpa: u64) -> Result<OwnedFd> {
     debug!("[+] Creating TDX vCPU (KVM_CREATE_VCPU)...");
     let vcpu = create_vcpu(vm_fd, 0)?;
     debug!(
@@ -881,7 +878,7 @@ fn configure_vcpu(kvm_fd: RawFd, vm_fd: BorrowedFd<'_>, hob_gpa: u64) -> Result<
     );
     set_cpuid2(vcpu.as_fd(), &cpuid)?;
     tdx_cmd(
-        vcpu.as_raw_fd(),
+        vcpu.as_fd(),
         KVM_TDX_INIT_VCPU,
         0,
         hob_gpa as usize as *mut libc::c_void,
@@ -890,7 +887,7 @@ fn configure_vcpu(kvm_fd: RawFd, vm_fd: BorrowedFd<'_>, hob_gpa: u64) -> Result<
     Ok(vcpu)
 }
 
-fn initialize_tdvf_memory(vcpu_fd: RawFd, tdvf: &TdvfImage) -> Result<()> {
+fn initialize_tdvf_memory(vcpu_fd: BorrowedFd<'_>, tdvf: &TdvfImage) -> Result<()> {
     for (index, section) in tdvf.sections.iter().enumerate() {
         let mut region = KvmTdxInitMemRegion {
             source_addr: tdvf.source_ptr(section) as u64,
@@ -924,15 +921,13 @@ fn initialize_tdvf_memory(vcpu_fd: RawFd, tdvf: &TdvfImage) -> Result<()> {
     Ok(())
 }
 
-fn enable_capability(vm_fd: RawFd, cap: u32, first_arg: u64) -> Result<()> {
+fn enable_capability(vm_fd: BorrowedFd<'_>, cap: u32, first_arg: u64) -> Result<()> {
     let enable = KvmEnableCap {
         cap,
         args: [first_arg, 0, 0, 0],
         ..Default::default()
     };
-    // SAFETY: callers keep the VM descriptor open for the duration of this call.
-    let vm = unsafe { BorrowedFd::borrow_raw(vm_fd) };
-    enable_cap(vm, &enable).map_err(io::Error::from)?;
+    enable_cap(vm_fd, &enable).map_err(io::Error::from)?;
     Ok(())
 }
 
@@ -943,30 +938,27 @@ extern "C" fn watchdog_handler(_: libc::c_int) {
 }
 
 fn native_u16(address: *const u8) -> u16 {
-    // SAFETY: caller provides a readable kvm_run union field.
     unsafe { ptr::read_unaligned(address.cast()) }
 }
 
 fn native_u32(address: *const u8) -> u32 {
-    // SAFETY: caller provides a readable kvm_run field.
     unsafe { ptr::read_unaligned(address.cast()) }
 }
 
 fn native_u64(address: *const u8) -> u64 {
-    // SAFETY: caller provides a readable kvm_run union field.
     unsafe { ptr::read_unaligned(address.cast()) }
 }
 
 fn write_native_i64(address: *mut u8, value: i64) {
-    // SAFETY: caller provides the writable hypercall return field.
     unsafe { ptr::write_unaligned(address.cast(), value) };
 }
 
-fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<TdReport> {
-    // SAFETY: callers keep both descriptors open throughout the run loop.
-    let kvm = unsafe { BorrowedFd::borrow_raw(kvm_fd) };
-    let vcpu = unsafe { BorrowedFd::borrow_raw(vcpu_fd) };
-    let mmap_size = get_vcpu_mmap_size(kvm).map_err(io::Error::from)? as usize;
+fn run_vcpu(
+    kvm_fd: BorrowedFd<'_>,
+    vm_fd: BorrowedFd<'_>,
+    vcpu_fd: BorrowedFd<'_>,
+) -> Result<TdReport> {
+    let mmap_size = get_vcpu_mmap_size(kvm_fd).map_err(io::Error::from)? as usize;
     let run = Mapping::shared(vcpu_fd, mmap_size)?;
     debug!("[+] TDX vCPU ready for execution!");
     debug!("[+] Executing guest CPU run loop (capturing COM1 UART 0x3F8 I/O exits)...");
@@ -988,7 +980,7 @@ fn run_vcpu(kvm_fd: RawFd, vm_fd: RawFd, vcpu_fd: RawFd) -> Result<TdReport> {
         WATCHDOG_FIRED.store(false, Ordering::Relaxed);
         // SAFETY: alarm only changes the process alarm timer.
         unsafe { libc::alarm(60) };
-        let result: Result<()> = run_cpu(vcpu).map_err(|error| io::Error::from(error).into());
+        let result: Result<()> = run_cpu(vcpu_fd).map_err(|error| io::Error::from(error).into());
         unsafe { libc::alarm(0) };
 
         if let Err(error) = result {
@@ -1138,7 +1130,7 @@ pub fn run_image(image: &[u8]) -> Result<TdReport> {
         vm.as_raw_fd()
     );
 
-    let tdvf = load_tdvf_image(vm.as_raw_fd(), image)?;
+    let tdvf = load_tdvf_image(vm.as_fd(), image)?;
 
     let split_irqchip = KvmEnableCap {
         cap: KVM_CAP_SPLIT_IRQCHIP,
@@ -1155,7 +1147,7 @@ pub fn run_image(image: &[u8]) -> Result<TdReport> {
         .map_err(io::Error::from)?
         > 0
         && enable_capability(
-            vm.as_raw_fd(),
+            vm.as_fd(),
             KVM_CAP_X86_APIC_BUS_CYCLES_NS,
             TDX_APIC_BUS_CYCLES_NS,
         )
@@ -1165,24 +1157,24 @@ pub fn run_image(image: &[u8]) -> Result<TdReport> {
     }
 
     enable_capability(
-        vm.as_raw_fd(),
+        vm.as_fd(),
         KVM_CAP_EXIT_HYPERCALL,
         1u64 << KVM_HC_MAP_GPA_RANGE,
     )?;
 
     debug!("[+] Fetching hardware TDX capabilities (get_tdx_capabilities)...");
-    let capabilities = get_tdx_capabilities(vm.as_raw_fd())?;
+    let capabilities = get_tdx_capabilities(vm.as_fd())?;
     debug!("[+] Initializing TDX VM (KVM_TDX_INIT_VM)...");
-    initialize_tdx_vm(kvm.as_raw_fd(), vm.as_raw_fd(), &capabilities)?;
+    initialize_tdx_vm(kvm.as_fd(), vm.as_fd(), &capabilities)?;
 
-    let vcpu = configure_vcpu(kvm.as_raw_fd(), vm.as_fd(), tdvf.hob_gpa)?;
-    initialize_tdvf_memory(vcpu.as_raw_fd(), &tdvf)?;
+    let vcpu = configure_vcpu(kvm.as_fd(), vm.as_fd(), tdvf.hob_gpa)?;
+    initialize_tdvf_memory(vcpu.as_fd(), &tdvf)?;
 
     debug!("[+] Finalizing TDX VM state (KVM_TDX_FINALIZE_VM)...");
-    tdx_cmd(vm.as_raw_fd(), KVM_TDX_FINALIZE_VM, 0, ptr::null_mut())?;
+    tdx_cmd(vm.as_fd(), KVM_TDX_FINALIZE_VM, 0, ptr::null_mut())?;
     debug!("[+] KVM_TDX_FINALIZE_VM finalized VM to RUNNABLE state!");
 
-    let report = run_vcpu(kvm.as_raw_fd(), vm.as_raw_fd(), vcpu.as_raw_fd())?;
+    let report = run_vcpu(kvm.as_fd(), vm.as_fd(), vcpu.as_fd())?;
     debug!("============================================================");
     Ok(report)
 }
