@@ -983,21 +983,34 @@ fn run_vcpu(
         let result: Result<()> = run_cpu(vcpu_fd).map_err(|error| io::Error::from(error).into());
         unsafe { libc::alarm(0) };
 
-        if let Err(error) = result {
-            if errno(&error) == Some(libc::EINTR) && WATCHDOG_FIRED.load(Ordering::Relaxed) {
-                bail!(
-                    "guest made no userspace-visible progress for 60 seconds; guest execution is likely halted"
-                );
-            }
-            if matches!(errno(&error), Some(libc::EINTR | libc::EAGAIN)) {
-                continue;
-            }
-            return Err(error);
-        }
-
         let base = run.as_ptr();
         // kvm_run is 32 bytes before its architecture-independent exit union on x86_64.
-        let exit_reason = native_u32(unsafe { base.add(8) });
+        let exit_reason = match result {
+            Ok(()) => native_u32(unsafe { base.add(8) }),
+            Err(error) => {
+                let error_number = errno(&error);
+                if error_number == Some(libc::EINTR) && WATCHDOG_FIRED.load(Ordering::Relaxed) {
+                    bail!(
+                        "guest made no userspace-visible progress for 60 seconds; guest execution is likely halted"
+                    );
+                }
+                if matches!(error_number, Some(libc::EINTR | libc::EAGAIN)) {
+                    continue;
+                }
+                // KVM reports memory-fault exits with a failed KVM_RUN. For other
+                // errors, exit_reason may be stale and must not be inspected.
+                if matches!(error_number, Some(libc::EFAULT | libc::EHWPOISON)) {
+                    let reason = native_u32(unsafe { base.add(8) });
+                    if reason == KVM_EXIT_MEMORY_FAULT {
+                        reason
+                    } else {
+                        return Err(error);
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+        };
         let union = unsafe { base.add(32) };
         match exit_reason {
             KVM_EXIT_HYPERCALL => {
