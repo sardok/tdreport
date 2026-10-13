@@ -381,6 +381,7 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "td-shim-interface",
 ]
 
 [[package]]

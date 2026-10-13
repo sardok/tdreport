@@ -19,6 +19,7 @@ use nix::{
     ioctl_none, ioctl_readwrite, ioctl_readwrite_bad, ioctl_write_int_bad, ioctl_write_ptr,
     request_code_none,
 };
+use td_shim_interface::metadata::TdxMetadataSection as TdvfSection;
 
 const LOW_MEM_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const FW_BASE: u64 = 0xff00_0000;
@@ -317,16 +318,6 @@ impl Default for KvmEnableCap {
             pad: [0; 64],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TdvfSection {
-    data_offset: u32,
-    raw_data_size: u32,
-    memory_address: u64,
-    memory_data_size: u64,
-    section_type: u32,
-    attributes: u32,
 }
 
 struct Mapping {
@@ -666,7 +657,7 @@ fn load_tdvf_image(vm_fd: RawFd, data: &[u8]) -> Result<TdvfImage> {
             raw_data_size: read_u32(&data, offset + 4)?,
             memory_address: read_u64(&data, offset + 8)?,
             memory_data_size: read_u64(&data, offset + 16)?,
-            section_type: read_u32(&data, offset + 24)?,
+            r#type: read_u32(&data, offset + 24)?,
             attributes: read_u32(&data, offset + 28)?,
         });
     }
@@ -711,7 +702,7 @@ fn load_tdvf_image(vm_fd: RawFd, data: &[u8]) -> Result<TdvfImage> {
         let source_end = source_start + section.raw_data_size as usize;
         destination[..section.raw_data_size as usize]
             .copy_from_slice(&data[source_start..source_end]);
-        if section.section_type == TDVF_SECTION_HOB {
+        if section.r#type == TDVF_SECTION_HOB {
             hob_gpa = section.memory_address;
             build_hob(destination, hob_gpa)?;
         }
