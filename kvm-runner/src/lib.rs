@@ -248,9 +248,30 @@ struct KvmCpuidEntry2 {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct KvmCpuid2 {
     nent: u32,
     padding: u32,
+}
+
+// Linux arch/x86/include/uapi/asm/kvm.h: struct kvm_tdx_init_vm.
+#[repr(C)]
+#[derive(Default)]
+struct KvmTdxInitVm {
+    attributes: u64,
+    xfam: u64,
+    mrconfigid: [u64; 6],
+    mrowner: [u64; 6],
+    mrownerconfig: [u64; 6],
+    reserved: [u64; 12],
+    cpuid: KvmCpuid2,
+}
+
+// Backing storage for the flexible CPUID entry array following the UAPI header.
+#[repr(C)]
+struct KvmTdxInitVmBuffer {
+    header: KvmTdxInitVm,
+    entries: [KvmCpuidEntry2; 512],
 }
 
 #[repr(C)]
@@ -779,7 +800,6 @@ fn get_tdx_capabilities(vm_fd: RawFd) -> Result<TdxCapabilities> {
 }
 
 fn initialize_tdx_vm(kvm_fd: RawFd, vm_fd: RawFd, caps: &TdxCapabilities) -> Result<()> {
-    const INIT_CPUID_OFFSET: usize = 256;
     let mut cpuid = CpuidSet::supported(kvm_fd, 512)?;
     cpuid.entries.retain_mut(|entry| {
         let Some(config) = caps
@@ -801,16 +821,29 @@ fn initialize_tdx_vm(kvm_fd: RawFd, vm_fd: RawFd, caps: &TdxCapabilities) -> Res
         cpuid.entries.len()
     );
 
-    let cpuid_buffer = cpuid.as_ioctl_buffer();
-    let mut init = vec![0u8; INIT_CPUID_OFFSET + cpuid_buffer.len()];
     let attributes = caps.supported_attrs & TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
-    write_u64(&mut init, 0, attributes)?;
-    write_u64(&mut init, 8, caps.supported_xfam)?;
-    init[INIT_CPUID_OFFSET..].copy_from_slice(&cpuid_buffer);
+    let mut init = KvmTdxInitVmBuffer {
+        header: KvmTdxInitVm {
+            attributes,
+            xfam: caps.supported_xfam,
+            cpuid: KvmCpuid2 {
+                nent: cpuid.entries.len() as u32,
+                padding: 0,
+            },
+            ..Default::default()
+        },
+        entries: [KvmCpuidEntry2::default(); 512],
+    };
+    init.entries[..cpuid.entries.len()].copy_from_slice(&cpuid.entries);
 
     let mut retries = 10_000;
     loop {
-        match tdx_cmd(vm_fd, KVM_TDX_INIT_VM, 0, init.as_mut_ptr().cast()) {
+        match tdx_cmd(
+            vm_fd,
+            KVM_TDX_INIT_VM,
+            0,
+            (&mut init as *mut KvmTdxInitVmBuffer).cast(),
+        ) {
             Ok(()) => break,
             Err(error) if errno(&error) == Some(libc::EAGAIN) && retries > 1 => {
                 retries -= 1;
@@ -1176,6 +1209,15 @@ mod tests {
 
     #[test]
     fn kvm_uapi_layout_matches_linux_x86_64() {
+        assert_eq!(size_of::<KvmTdxInitVm>(), 264);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, attributes), 0);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, xfam), 8);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, mrconfigid), 16);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, mrowner), 64);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, mrownerconfig), 112);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, reserved), 160);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVm, cpuid), 256);
+        assert_eq!(std::mem::offset_of!(KvmTdxInitVmBuffer, entries), 264);
         assert_eq!(size_of::<KvmCpuidEntry2>(), 40);
         assert_eq!(size_of::<KvmCpuid2>(), 8);
         assert_eq!(size_of::<KvmUserspaceMemoryRegion2>(), 160);
