@@ -378,7 +378,6 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "libc",
  "log",
  "nix",
  "td-shim-interface",

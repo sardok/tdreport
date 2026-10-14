@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-libc = "0.2"
 log = "0.4"
-nix = { version = "0.31.3", features = ["ioctl"] }
+nix = { version = "0.31.3", features = ["ioctl", "mman", "signal"] }
 td-shim-interface = { path = "../third_party/td-shim/td-shim-interface" }

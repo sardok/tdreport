@@ -4,17 +4,23 @@
 //! exposed by stable high-level KVM crates yet, so the small UAPI surface used
 //! here is represented explicitly with `#[repr(C)]` structures.
 
+use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::mem::{size_of, zeroed};
+use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use log::{debug, error};
+use nix::libc::{E2BIG, EAGAIN, EFAULT, EHWPOISON, EINTR, EIO};
+use nix::sys::mman;
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::unistd::alarm;
 use nix::{
     ioctl_readwrite, ioctl_readwrite_bad, ioctl_write_int_bad, ioctl_write_ptr, request_code_none,
 };
@@ -28,7 +34,7 @@ const TDVF_SIGNATURE: u32 = 0x4656_4454;
 const TDVF_SECTION_HOB: u32 = 2;
 
 const KVM_API_VERSION: i32 = 12;
-const KVM_X86_TDX_VM: libc::c_ulong = 5;
+const KVM_X86_TDX_VM: c_ulong = 5;
 const KVM_CAP_SPLIT_IRQCHIP: u32 = 121;
 const KVM_CAP_EXIT_HYPERCALL: u32 = 201;
 const KVM_CAP_X86_APIC_BUS_CYCLES_NS: u32 = 237;
@@ -125,7 +131,7 @@ ioctl_readwrite!(
 // The request encodes sizeof(unsigned long), while TDX passes a KvmTdxCmd pointer.
 ioctl_readwrite_bad!(
     kvm_memory_encrypt_op,
-    nix::request_code_readwrite!(KVMIO, KVM_MEMORY_ENCRYPT_OP, size_of::<libc::c_ulong>()),
+    nix::request_code_readwrite!(KVMIO, KVM_MEMORY_ENCRYPT_OP, size_of::<c_ulong>()),
     KvmTdxCmd
 );
 
@@ -351,31 +357,27 @@ impl Default for KvmEnableCap {
 }
 
 struct Mapping {
-    address: *mut u8,
+    address: NonNull<u8>,
     size: usize,
 }
 
 impl Mapping {
     fn anonymous(size: usize, no_reserve: bool) -> Result<Self> {
-        let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        let length = NonZeroUsize::new(size).context("mapping size must be nonzero")?;
+        let mut flags = mman::MapFlags::MAP_PRIVATE;
         if no_reserve {
-            flags |= libc::MAP_NORESERVE;
+            flags |= mman::MapFlags::MAP_NORESERVE;
         }
-        // SAFETY: mmap is called with a null hint and anonymous backing.  The
-        // returned mapping is uniquely owned by this value and unmapped in Drop.
+        // SAFETY: the mapping uses a null hint and anonymous backing.
         let address = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
+            mman::mmap_anonymous(
+                None,
+                length,
+                mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
                 flags,
-                -1,
-                0,
             )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error().into());
         }
+        .map_err(io::Error::from)?;
         Ok(Self {
             address: address.cast(),
             size,
@@ -383,20 +385,19 @@ impl Mapping {
     }
 
     fn shared(fd: BorrowedFd<'_>, size: usize) -> Result<Self> {
+        let length = NonZeroUsize::new(size).context("mapping size must be nonzero")?;
         // SAFETY: KVM exposes a shared kvm_run mapping at offset zero.
         let address = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
+            mman::mmap(
+                None,
+                length,
+                mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+                mman::MapFlags::MAP_SHARED,
+                fd,
                 0,
             )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error().into());
         }
+        .map_err(io::Error::from)?;
         Ok(Self {
             address: address.cast(),
             size,
@@ -404,7 +405,7 @@ impl Mapping {
     }
 
     fn as_ptr(&self) -> *mut u8 {
-        self.address
+        self.address.as_ptr()
     }
 
     fn slice_mut(&mut self, offset: u64, size: u64) -> Result<&mut [u8]> {
@@ -415,14 +416,14 @@ impl Mapping {
             .filter(|end| *end <= self.size)
             .context("mapping range out of bounds")?;
         // SAFETY: bounds were checked against the owned mapping above.
-        Ok(unsafe { slice::from_raw_parts_mut(self.address.add(offset), end - offset) })
+        Ok(unsafe { slice::from_raw_parts_mut(self.address.as_ptr().add(offset), end - offset) })
     }
 }
 
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: address and size came from a successful mmap and are unmapped once.
-        unsafe { libc::munmap(self.address.cast(), self.size) };
+        let _ = unsafe { mman::munmap(self.address.cast(), self.size) };
     }
 }
 
@@ -544,7 +545,7 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<()> {
     Ok(())
 }
 
-fn tdx_cmd(fd: BorrowedFd<'_>, id: u32, flags: u32, data: *mut libc::c_void) -> Result<()> {
+fn tdx_cmd(fd: BorrowedFd<'_>, id: u32, flags: u32, data: *mut c_void) -> Result<()> {
     let mut command = KvmTdxCmd {
         id,
         flags,
@@ -790,7 +791,7 @@ fn get_tdx_capabilities(vm_fd: BorrowedFd<'_>) -> Result<TdxCapabilities> {
                 );
                 return Ok(capabilities);
             }
-            Err(error) if errno(&error) == Some(libc::E2BIG) => {
+            Err(error) if errno(&error) == Some(E2BIG) => {
                 capacity *= 2;
                 if capacity > 512 {
                     bail!("KVM TDX CPUID entries exceed limit 512");
@@ -851,7 +852,7 @@ fn initialize_tdx_vm(
             (&mut init as *mut KvmTdxInitVmBuffer).cast(),
         ) {
             Ok(()) => break,
-            Err(error) if errno(&error) == Some(libc::EAGAIN) && retries > 1 => {
+            Err(error) if errno(&error) == Some(EAGAIN) && retries > 1 => {
                 retries -= 1;
             }
             Err(error) => return Err(error),
@@ -890,7 +891,7 @@ fn configure_vcpu(kvm_fd: BorrowedFd<'_>, vm_fd: BorrowedFd<'_>, hob_gpa: u64) -
         vcpu.as_fd(),
         KVM_TDX_INIT_VCPU,
         0,
-        hob_gpa as usize as *mut libc::c_void,
+        hob_gpa as usize as *mut c_void,
     )?;
     debug!("[+] KVM_TDX_INIT_VCPU succeeded (HOB GPA 0x{hob_gpa:x}).");
     Ok(vcpu)
@@ -916,7 +917,7 @@ fn initialize_tdvf_memory(vcpu_fd: BorrowedFd<'_>, tdvf: &TdvfImage) -> Result<(
                 (&mut region as *mut KvmTdxInitMemRegion).cast(),
             ) {
                 Ok(()) => break,
-                Err(error) if matches!(errno(&error), Some(libc::EAGAIN | libc::EINTR)) => {}
+                Err(error) if matches!(errno(&error), Some(EAGAIN | EINTR)) => {}
                 Err(error) => {
                     bail!("KVM_TDX_INIT_MEM_REGION section {index} failed: {error}");
                 }
@@ -942,7 +943,7 @@ fn enable_capability(vm_fd: BorrowedFd<'_>, cap: u32, first_arg: u64) -> Result<
 
 static WATCHDOG_FIRED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn watchdog_handler(_: libc::c_int) {
+extern "C" fn watchdog_handler(_: c_int) {
     WATCHDOG_FIRED.store(true, Ordering::Relaxed);
 }
 
@@ -974,23 +975,19 @@ fn run_vcpu(
     debug!("------------------------------------------------------------");
     let mut td_report = Vec::with_capacity(TD_REPORT_SIZE);
 
-    // SAFETY: the zeroed sigaction is initialized before installation.  The
-    // handler only performs an atomic store, which is async-signal-safe.  No
-    // SA_RESTART flag is set because SIGALRM must interrupt KVM_RUN.
-    unsafe {
-        let mut action: libc::sigaction = zeroed();
-        action.sa_sigaction = watchdog_handler as *const () as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        if libc::sigaction(libc::SIGALRM, &action, ptr::null_mut()) < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
+    // No SA_RESTART flag: SIGALRM must interrupt KVM_RUN.
+    let action = SigAction::new(
+        SigHandler::Handler(watchdog_handler),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    unsafe { signal::sigaction(Signal::SIGALRM, &action) }.map_err(io::Error::from)?;
     loop {
         WATCHDOG_FIRED.store(false, Ordering::Relaxed);
-        // SAFETY: alarm only changes the process alarm timer.
-        unsafe { libc::alarm(60) };
+        // Set an alarm to prevent indefinite waiting in case guest VM stucks
+        alarm::set(60);
         let result: Result<()> = run_cpu(vcpu_fd).map_err(|error| io::Error::from(error).into());
-        unsafe { libc::alarm(0) };
+        alarm::cancel();
 
         let base = run.as_ptr();
         // kvm_run is 32 bytes before its architecture-independent exit union on x86_64.
@@ -998,17 +995,17 @@ fn run_vcpu(
             Ok(()) => native_u32(unsafe { base.add(8) }),
             Err(error) => {
                 let error_number = errno(&error);
-                if error_number == Some(libc::EINTR) && WATCHDOG_FIRED.load(Ordering::Relaxed) {
+                if error_number == Some(EINTR) && WATCHDOG_FIRED.load(Ordering::Relaxed) {
                     bail!(
                         "guest made no userspace-visible progress for 60 seconds; guest execution is likely halted"
                     );
                 }
-                if matches!(error_number, Some(libc::EINTR | libc::EAGAIN)) {
+                if matches!(error_number, Some(EINTR | EAGAIN)) {
                     continue;
                 }
                 // KVM reports memory-fault exits with a failed KVM_RUN. For other
                 // errors, exit_reason may be stale and must not be inspected.
-                if matches!(error_number, Some(libc::EFAULT | libc::EHWPOISON)) {
+                if matches!(error_number, Some(EFAULT | EHWPOISON)) {
                     let reason = native_u32(unsafe { base.add(8) });
                     if reason == KVM_EXIT_MEMORY_FAULT {
                         reason
@@ -1037,7 +1034,7 @@ fn run_vcpu(
                     flags & KVM_MAP_GPA_RANGE_ENCRYPTED != 0,
                 ) {
                     Ok(()) => 0,
-                    Err(error) => -(errno(&error).unwrap_or(libc::EIO) as i64),
+                    Err(error) => -(errno(&error).unwrap_or(EIO) as i64),
                 };
                 write_native_i64(unsafe { union.add(56) }, status);
             }
