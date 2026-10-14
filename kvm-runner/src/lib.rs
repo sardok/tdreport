@@ -16,8 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, bail};
 use log::{debug, error};
 use nix::{
-    ioctl_none, ioctl_readwrite, ioctl_readwrite_bad, ioctl_write_int_bad, ioctl_write_ptr,
-    request_code_none,
+    ioctl_readwrite, ioctl_readwrite_bad, ioctl_write_int_bad, ioctl_write_ptr, request_code_none,
 };
 use td_shim_interface::metadata::TdxMetadataSection as TdvfSection;
 
@@ -78,16 +77,26 @@ const KVM_SET_USER_MEMORY_REGION2: u32 = 0x49;
 const KVM_SET_MEMORY_ATTRIBUTES: u32 = 0xd2;
 
 ioctl_write_int_bad!(kvm_create_vcpu, request_code_none!(KVMIO, KVM_CREATE_VCPU));
-ioctl_none!(kvm_get_api_version, KVMIO, KVM_GET_API_VERSION);
-ioctl_none!(kvm_get_vcpu_mmap_size, KVMIO, KVM_GET_VCPU_MMAP_SIZE);
-ioctl_none!(kvm_run, KVMIO, KVM_RUN);
+// KVM requires a zero argument even for these no-parameter requests.
+ioctl_write_int_bad!(
+    kvm_get_api_version,
+    request_code_none!(KVMIO, KVM_GET_API_VERSION)
+);
+ioctl_write_int_bad!(
+    kvm_get_vcpu_mmap_size,
+    request_code_none!(KVMIO, KVM_GET_VCPU_MMAP_SIZE)
+);
+ioctl_write_int_bad!(kvm_run, request_code_none!(KVMIO, KVM_RUN));
 ioctl_readwrite!(
     kvm_get_supported_cpuid,
     KVMIO,
     KVM_GET_SUPPORTED_CPUID,
     KvmCpuid2
 );
-ioctl_none!(kvm_create_irqchip, KVMIO, KVM_CREATE_IRQCHIP);
+ioctl_write_int_bad!(
+    kvm_create_irqchip,
+    request_code_none!(KVMIO, KVM_CREATE_IRQCHIP)
+);
 ioctl_write_int_bad!(
     kvm_check_extension,
     request_code_none!(KVMIO, KVM_CHECK_EXTENSION)
@@ -131,13 +140,13 @@ fn memory_encrypt_opt(fd: BorrowedFd<'_>, command: &mut KvmTdxCmd) -> nix::Resul
 
 fn get_vcpu_mmap_size(kvm: BorrowedFd<'_>) -> nix::Result<i32> {
     // SAFETY: this ioctl has no pointer argument and returns the mapping size.
-    unsafe { kvm_get_vcpu_mmap_size(kvm.as_raw_fd()) }
+    unsafe { kvm_get_vcpu_mmap_size(kvm.as_raw_fd(), 0) }
 }
 
 fn run_cpu(vcpu: BorrowedFd<'_>) -> nix::Result<()> {
     // SAFETY: internal callers keep the vCPU's kvm_run mapping live during execution.
     unsafe {
-        kvm_run(vcpu.as_raw_fd())?;
+        kvm_run(vcpu.as_raw_fd(), 0)?;
     }
     Ok(())
 }
@@ -162,13 +171,13 @@ fn get_supported_cpuid(kvm: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<()> {
 
 fn get_api_version(kvm: BorrowedFd<'_>) -> nix::Result<i32> {
     // SAFETY: this ioctl has no pointer argument and returns the API version.
-    unsafe { kvm_get_api_version(kvm.as_raw_fd()) }
+    unsafe { kvm_get_api_version(kvm.as_raw_fd(), 0) }
 }
 
 fn create_irqchip(vm: BorrowedFd<'_>) -> nix::Result<()> {
     // SAFETY: this ioctl has no pointer argument.
     unsafe {
-        kvm_create_irqchip(vm.as_raw_fd())?;
+        kvm_create_irqchip(vm.as_raw_fd(), 0)?;
     }
     Ok(())
 }
